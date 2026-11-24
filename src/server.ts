@@ -8,7 +8,7 @@ import {
 } from "./types.js";
 
 export async function serve(entry: string, role: Role): Promise<void> {
-  const server = new McpServer({ name: "agent-pair", version: "0.2.1" });
+  const server = new McpServer({ name: "agent-pair", version: "0.3.0" });
   const invoke = async (request: Request, signal: AbortSignal) => {
     try {
       const result = await relayCall(entry, request, signal);

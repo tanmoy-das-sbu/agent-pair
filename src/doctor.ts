@@ -27,7 +27,7 @@ export async function doctor(entry: string, profiles: readonly Role[] = pairRole
   const clients = [profiles[0], ...workerProfiles].map((role) => {
     const reg = registration(entry, role);
     return {
-      client: new Client({ name: `agent-pair-doctor-${role}`, version: "0.2.1" }),
+      client: new Client({ name: `agent-pair-doctor-${role}`, version: "0.3.0" }),
       transport: new StdioClientTransport({
         ...reg,
         env: { ...reg.env, AGENT_PAIR_NO_DASHBOARD: "1" },

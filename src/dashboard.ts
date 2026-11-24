@@ -921,6 +921,57 @@ function dashboardHtml(token: string, nonce: string): string {
     .setup-row { border-top: 1px solid var(--border); padding: 12px 0; overflow-wrap: anywhere; }
     .setup-row p { margin: 5px 0 9px; color: var(--muted); }
     .setup-status { color: var(--muted); }
+    .team-map { margin-bottom: 20px; }
+    .map-header { display: flex; justify-content: space-between; align-items: center; gap: 12px; flex-wrap: wrap; }
+    .map-header h2, .map-section h3 { margin: 0; }
+    .map-attention { display: flex; flex-wrap: wrap; gap: 6px; margin: 12px 0 20px; }
+    .map-lead { display: grid; justify-content: center; }
+    .map-stem { height: 20px; width: 2px; margin: auto; background: var(--border); }
+    .map-workers { border-top: 2px solid var(--border); display: grid; grid-template-columns: repeat(auto-fit, minmax(min(165px, 100%), 1fr)); gap: 12px; }
+    .map-branch { position: relative; padding-top: 14px; }
+    .map-branch::before { content: ""; position: absolute; top: 0; left: 50%; height: 14px; border-left: 2px solid var(--border); }
+    .map-node { width: 100%; text-align: left; font: inherit; cursor: pointer; color: var(--ink); background: var(--surface-2); border: 2px solid var(--border); border-radius: 14px; padding: 10px; display: grid; gap: 5px; overflow-wrap: anywhere; }
+    .map-node[aria-pressed="true"] { border-color: var(--accent); outline: 1px solid var(--accent); }
+    .map-node-top { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; }
+    .map-node .state-badge { margin-top: 0; justify-self: start; }
+    .map-bot-row { display: flex; align-items: center; gap: 10px; min-height: 42px; }
+    .map-bot-role { color: var(--muted); font-size: 0.76rem; font-weight: 700; }
+    .map-bot {
+      --bot-color: #aec2e4;
+      position: relative; flex: 0 0 36px; height: 29px; margin: 8px 3px 4px;
+      border: 2px solid #29263e; border-radius: 12px;
+      background: var(--bot-color); box-shadow: 0 3px 0 var(--comic-shadow);
+      color: #29263e; display: grid; place-items: center;
+    }
+    .map-bot::before {
+      content: ""; position: absolute; width: 8px; height: 8px; left: 12px; top: -8px;
+      background: var(--bot-color); border: 2px solid #29263e; border-radius: 50%;
+    }
+    .map-bot::after {
+      content: ""; position: absolute; left: 12px; bottom: 4px;
+      width: 8px; height: 4px; border-bottom: 2px solid currentColor; border-radius: 50%;
+    }
+    .map-bot-eyes { width: 4px; height: 5px; margin: 0 10px 4px 0; border-radius: 50%; background: currentColor; box-shadow: 10px 0 currentColor; animation: bot-blink 4s infinite; }
+    .map-bot-lead { --bot-color: #c3acff; }
+    .map-bot-frontend { --bot-color: #ffacd3; }
+    .map-bot-backend { --bot-color: #8ddfdc; }
+    .map-bot-quality { --bot-color: #ffcb83; }
+    .map-bot-docs { --bot-color: #afe4a3; }
+    .map-bot-build { --bot-color: #a7c8ff; }
+    .map-bot-working { animation: bob 1.8s ease-in-out infinite; }
+    .map-bot-idle, .map-bot-waiting { animation: bob 3.6s ease-in-out infinite; }
+    .map-bot-blocked { animation: wobble 2.6s ease-in-out infinite; }
+    .map-bot-review { animation: happyHop 2.8s ease-in-out infinite; }
+    .map-bot-disconnected { opacity: 0.45; }
+    .map-bot-disconnected .map-bot-eyes { animation: none; }
+    @keyframes bot-blink { 0%, 43%, 49%, 100% { transform: scaleY(1); } 46% { transform: scaleY(0.12); } }
+    .map-detail { border: 1px solid var(--border); padding: 12px; border-radius: 12px; margin-top: 14px; overflow-wrap: anywhere; }
+    .map-detail p { margin: 6px 0; white-space: pre-wrap; }
+    .map-section { margin-top: 18px; }
+    .map-dependencies { display: grid; gap: 6px; margin-top: 8px; }
+    .map-dependency { width: 100%; text-align: left; overflow-wrap: anywhere; }
+    .map-branch.map-pulse::before, .map-stem.map-pulse { animation: map-signal 0.8s ease-out; }
+    @keyframes map-signal { from { box-shadow: 0 0 0 4px var(--accent); } to { box-shadow: 0 0 0 0 transparent; } }
   </style>
 </head>
 <body>
@@ -945,6 +996,7 @@ function dashboardHtml(token: string, nonce: string): string {
       <div class="controls">
         <span class="pill" id="connPill"><span class="live-dot" id="connDot"></span><span id="connText">Connecting...</span></span>
         <select class="run-select" id="runSelect" style="display:none" aria-label="Active team run"></select>
+        <button class="btn" id="teamMapBtn" type="button" aria-pressed="false">Team Map</button>
         <button class="btn" id="copyWorkerBtn" type="button" title="Copy the worker join prompt">Copy Worker Prompt</button>
         <button class="btn" id="soundBtn" type="button" title="Toggle soft chime sounds">Sound: Off</button>
         <button class="btn" id="themeBtn" type="button" title="Switch cozy dark or cream paper theme">Cream Paper</button>
@@ -991,6 +1043,7 @@ function dashboardHtml(token: string, nonce: string): string {
         <button class="btn" id="cancelFolder" type="button">Cancel</button>
       </div>
     </dialog>
+    <section id="teamMap" class="panel team-map" aria-label="Team map" hidden></section>
     <main id="app"></main>
   </div>
   <div class="toast" id="toast" role="status" aria-live="polite"></div>
@@ -1005,11 +1058,26 @@ function dashboardHtml(token: string, nonce: string): string {
     let selectedRunId = null;
     let taskFilter = "all";
     let demoMode = false;
+    let mapVisible = false;
+    let mapSelection;
     let soundOn = false;
     let audioContext;
     let lastEventKey = "";
 
     const appEl = document.getElementById("app");
+    const teamMap = document.getElementById("teamMap");
+    const teamMapBtn = document.getElementById("teamMapBtn");
+    teamMapBtn.addEventListener("click", () => {
+      mapVisible = !mapVisible;
+      if (mapVisible && !snapshot.runs.length) demoMode = true;
+      render();
+    });
+    teamMap.addEventListener("click", (event) => {
+      const node = event.target.closest("[data-map-member], [data-map-dependency]");
+      if (!node) return;
+      mapSelection = { runId: selectedRunId, member: node.dataset.mapMember, dependency: node.dataset.mapDependency };
+      render();
+    });
     const runSelect = document.getElementById("runSelect");
     const connDot = document.getElementById("connDot");
     const connText = document.getElementById("connText");
@@ -1340,13 +1408,14 @@ function dashboardHtml(token: string, nonce: string): string {
           members: [
             { member: "orchestrator", profile: "codex", isOrchestrator: true, connected: true, claimed: true, hasSessionId: true, status: "working", currentTaskId: "api", currentTaskTitle: "Build REST API & OpenAPI schema", unread: 1, lastActivityAt: now - 8_000 },
             { member: "frontend", profile: "antigravity", isOrchestrator: false, connected: true, claimed: true, hasSessionId: true, status: "review", currentTaskId: "ui", currentTaskTitle: "Design cozy task board UI", unread: 0, lastActivityAt: now - 19_000 },
-            { member: "quality", profile: "claude", isOrchestrator: false, connected: true, claimed: true, hasSessionId: true, status: "blocked", currentTaskId: "tests", currentTaskTitle: "Add end-to-end integration tests", unread: 0, lastActivityAt: now - 45_000 },
+            { member: "quality", profile: "claude", isOrchestrator: false, connected: true, claimed: true, hasSessionId: true, status: "blocked", currentTaskId: "fixtures", currentTaskTitle: "Prepare test fixtures", unread: 0, lastActivityAt: now - 45_000 },
             { member: "docs", profile: "antigravity", isOrchestrator: false, connected: false, claimed: false, hasSessionId: false, status: "waiting", currentTaskId: "readme", currentTaskTitle: "Write quickstart & examples", unread: 0 },
           ],
           tasks: [
             { id: "api", owner: "orchestrator", profile: "codex", title: "Build REST API & OpenAPI schema", paths: ["src/api/"], checks: ["npm test passes"], dependsOn: [], state: "accepted", note: "Endpoints verified", evidence: ["All 14 API tests passed"] },
             { id: "ui", owner: "frontend", profile: "antigravity", title: "Design cozy task board UI", paths: ["src/ui/"], checks: ["UI renders cleanly"], dependsOn: ["api"], state: "ready", note: "UI ready with dark & cream themes!", evidence: ["Build succeeded", "Responsive layout verified"] },
-            { id: "tests", owner: "quality", profile: "claude", title: "Add end-to-end integration tests", paths: ["test/"], checks: ["E2E suite green"], dependsOn: ["ui"], state: "blocked", note: "Waiting for /api/health mock fixture from orchestrator" },
+            { id: "fixtures", owner: "quality", profile: "claude", title: "Prepare test fixtures", paths: ["test/fixtures/"], checks: ["Fixtures cover common failures"], dependsOn: [], state: "blocked", note: "Waiting for the mock auth token helper." },
+            { id: "tests", owner: "quality", profile: "claude", title: "Add end-to-end integration tests", paths: ["test/"], checks: ["E2E suite green"], dependsOn: ["ui"], state: "pending" },
             { id: "readme", owner: "docs", profile: "antigravity", title: "Write quickstart & examples", paths: ["README.md"], checks: ["Links verified"], dependsOn: [], state: "pending" },
           ],
           messages: [
@@ -1367,9 +1436,95 @@ function dashboardHtml(token: string, nonce: string): string {
       return snapshot;
     }
 
-    function render() {
+    function renderMap(run, pulse) {
+      teamMap.hidden = !mapVisible || !run;
+      teamMapBtn.setAttribute("aria-pressed", String(!teamMap.hidden));
+      teamMapBtn.classList.toggle("active-toggle", !teamMap.hidden);
+      if (teamMap.hidden) return;
+      const lead = run.members.find((member) => member.isOrchestrator);
+      const workers = run.members.filter((member) => member !== lead);
+      const tasks = new Map(run.tasks.map((task) => [task.id, task]));
+      const links = run.tasks.flatMap((task) => task.dependsOn.map((id) => ({
+        from: tasks.get(id), to: task, key: id + "/" + task.id,
+      }))).filter((link) => link.from);
+      const selection = mapSelection?.runId === run.id ? mapSelection : null;
+      const dependency = links.find((link) => link.key === selection?.dependency);
+      const member = run.members.find((entry) => entry.member === selection?.member) || lead;
+      const reviewCount = run.tasks.filter((task) => task.state === "ready").length;
+      const blockedCount = run.tasks.filter((task) => task.state === "blocked").length;
+      const waitingCount = links.filter((link) => link.to.state === "pending" && link.from.state !== "accepted").length;
+      const signalMembers = pulse?.runId === run.id ? pulse.members : [];
+
+      function botRole(entry) {
+        if (entry.isOrchestrator) return ["lead", "Coordination"];
+        const task = tasks.get(entry.currentTaskId);
+        const assignment = (entry.member + " " + (task ? task.id + " " + task.paths.join(" ") + " " + task.title : "")).toLowerCase();
+        if (/\\b(frontend|ui|ux|design|styles|components)\\b/.test(assignment)) return ["frontend", "Frontend"];
+        if (/\\b(quality|qa|tests?|fixtures)\\b/.test(assignment)) return ["quality", "Testing"];
+        if (/\\b(docs|documentation|readme|copy)\\b/.test(assignment)) return ["docs", "Documentation"];
+        if (/\\b(backend|api|server|database)\\b/.test(assignment)) return ["backend", "Backend"];
+        if (/\\b(build|ci|deploy|release|automation)\\b/.test(assignment)) return ["build", "Build and release"];
+        return ["general", "General work"];
+      }
+
+      function node(entry) {
+        const info = statusInfo(entry.status);
+        const [botColor, botLabel] = botRole(entry);
+        return '<button class="map-node" type="button" data-map-member="' + esc(entry.member) +
+          '" aria-pressed="' + String(!dependency && member === entry) + '">' +
+          '<span class="map-bot-row"><span class="map-bot map-bot-' + botColor + ' map-bot-' + esc(entry.status) +
+          '" aria-hidden="true"><span class="map-bot-eyes"></span></span><span class="map-bot-role">' + botLabel + '</span></span>' +
+          '<span class="map-node-top"><strong>' + esc(entry.isOrchestrator ? "Orchestrator" : entry.member) +
+          '</strong><span class="client-chip client-' + esc(entry.profile) + '">' + esc(CLIENT_NAMES[entry.profile]) +
+          '</span></span><span class="state-badge ' + info.cls + '">' + esc(info.label) + '</span>' +
+          (entry.currentTaskTitle ? '<span>' + esc(entry.currentTaskTitle) + '</span>' : '') + '</button>';
+      }
+
+      let detail = "";
+      if (dependency) {
+        detail = '<strong>' + esc(dependency.to.title) + '</strong><p>Depends on ' + esc(dependency.from.title) +
+          ' (' + esc(dependency.from.owner) + ').</p><p>' +
+          (dependency.from.state === "accepted" ? "Prerequisite accepted." : "The orchestrator must accept the prerequisite before this task can start.") +
+          '</p>' + (dependency.from.note ? '<p>' + esc(dependency.from.note) + '</p>' : '');
+      } else if (member) {
+        const owned = run.tasks.filter((task) => task.owner === member.member);
+        const latest = run.messages.findLast((message) => message.from === member.member || message.to === member.member);
+        detail = '<strong>' + esc(member.isOrchestrator ? "Orchestrator" : member.member) + '</strong>' +
+          owned.map((task) => '<p><strong>' + esc(task.title) + '</strong> · ' + esc(taskStateInfo(task.state).label) +
+            '<br>Owned paths: ' + esc(task.paths.join(", ") || "None") + '</p>' +
+            (task.note ? '<p>' + esc(task.note) + '</p>' : '')).join("") +
+          (latest ? '<p>Latest message (' + esc(latest.from) + ' → ' + esc(latest.to) + '): ' + esc(latest.body) + '</p>' : '');
+      }
+
+      const focused = teamMap.contains(document.activeElement) ? document.activeElement.dataset : null;
+      teamMap.innerHTML =
+        '<div class="map-header"><h2>Team Map</h2>' + (demoMode ? '<span class="pill">Demo</span>' : '') + '</div>' +
+        '<div class="map-attention"><span class="pill">' + reviewCount + ' ready for review</span>' +
+          '<span class="pill">' + blockedCount + ' blocked</span><span class="pill">' + waitingCount + ' unmet dependencies</span></div>' +
+        (lead ? '<div class="map-lead">' + node(lead) + '</div>' : '') +
+        (workers.length ? '<div class="map-stem' + (signalMembers.length ? ' map-pulse' : '') + '"></div><div class="map-workers">' +
+          workers.map((worker) => '<div class="map-branch' + (signalMembers.includes(worker.member) ? ' map-pulse' : '') + '">' +
+            node(worker) + '</div>').join("") + '</div>' : '') +
+        (detail ? '<div class="map-detail">' + detail + '</div>' : '') +
+        (links.length ? '<div class="map-section"><h3>Task dependencies</h3><div class="map-dependencies">' +
+          links.map((link) => '<button class="btn map-dependency' +
+            (dependency === link ? ' active-toggle' : '') + '" type="button" data-map-dependency="' + esc(link.key) +
+            '" aria-pressed="' + String(dependency === link) + '">' + esc(link.from.title) + ' → ' + esc(link.to.title) +
+            ' <span class="state-badge ' + (link.from.state === "accepted" ? 'st-done' : 'st-waiting') + '">' +
+            (link.from.state === "accepted" ? 'Accepted' : 'Awaiting acceptance') + '</span></button>').join("") +
+          '</div></div>' : '');
+      if (focused) {
+        const selector = focused.mapMember ? "[data-map-member]" : "[data-map-dependency]";
+        [...teamMap.querySelectorAll(selector)].find((element) =>
+          focused.mapMember ? element.dataset.mapMember === focused.mapMember
+            : element.dataset.mapDependency === focused.mapDependency)?.focus({ preventScroll: true });
+      }
+    }
+
+    function render(pulse) {
       const data = activeData();
       const run = data.runs.find((r) => r.id === selectedRunId) || data.runs[0];
+      renderMap(run, pulse);
       if (data.runs.length > 1) {
         runSelect.style.display = "inline-flex";
         runSelect.innerHTML = data.runs.map((r) =>
@@ -1595,12 +1750,16 @@ function dashboardHtml(token: string, nonce: string): string {
           '<div class="lounge-actions">' +
             '<button class="btn" id="loungeOrchBtn" type="button">Copy Orchestrator Prompt</button>' +
             '<button class="btn" id="loungeWorkerBtn" type="button">Copy Worker Prompt</button>' +
-            '<button class="btn active-toggle" id="demoBtn" type="button">👀 Preview Demo</button>' +
+            '<button class="btn active-toggle" id="demoBtn" type="button">Preview Team Map Demo</button>' +
           "</div>" +
         "</section>";
       document.getElementById("loungeOrchBtn").addEventListener("click", () => copyText(ORCH_PROMPT, "Orchestrator prompt copied!"));
       document.getElementById("loungeWorkerBtn").addEventListener("click", () => copyText(WORKER_PROMPT, "Worker join prompt copied!"));
-      document.getElementById("demoBtn").addEventListener("click", () => { demoMode = true; render(); });
+      document.getElementById("demoBtn").addEventListener("click", () => {
+        demoMode = true;
+        mapVisible = true;
+        render({ runId: "demo-run", members: ["frontend"] });
+      });
     }
 
     function connectEvents() {
@@ -1614,11 +1773,21 @@ function dashboardHtml(token: string, nonce: string): string {
         const key = next.runs.map((r) => r.id + ":" + r.members.filter((m) => m.connected).length + ":" + r.messages.length + ":" + r.tasks.map((t) => t.state).join(",")).join("|");
         if (lastEventKey && key !== lastEventKey) playPop(440);
         lastEventKey = key;
+        const upcoming = next.runs.find((run) => run.id === selectedRunId) || next.runs[0];
+        const previous = snapshot.runs.find((run) => run.id === upcoming?.id);
+        let pulse;
+        if (previous) {
+          const sent = upcoming.messages.slice(previous.messages.length);
+          const joined = upcoming.members.filter((member) => member.connected &&
+            previous.members.some((old) => old.member === member.member && !old.connected));
+          const members = [...new Set([...sent.flatMap((message) => [message.from, message.to]), ...joined.map((member) => member.member)])];
+          if (members.length) pulse = { runId: upcoming.id, members };
+        }
         snapshot = next;
         renderSetups(next.setups);
         connDot.classList.remove("offline");
         connText.textContent = "Live";
-        render();
+        render(pulse);
       });
       source.addEventListener("error", () => {
         connDot.classList.add("offline");

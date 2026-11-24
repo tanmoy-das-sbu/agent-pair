@@ -31,6 +31,8 @@ The relay validates overlapping file and directory assignments across owners and
 
 ### Live browser dashboard
 
+Open **Team Map** to see the orchestrator, workers, and task dependencies. Select a worker or a dependency for details. Use **Preview Team Map Demo** from the dashboard before starting a team.
+
 To configure a run in the browser, open `agent-pair dashboard` and use **Set up a team**. Enter the absolute project folder, choose an orchestrator, and set the number of additional workers per client. Save the setup and copy its orchestrator prompt into a fresh session of the selected client in that folder. Once the orchestrator starts the team, open the worker sessions in the same folder and give each the generic worker prompt. The dashboard shows assignments and dependencies as soon as the orchestrator starts the run.
 
 A saved setup expires after 30 minutes. Saving again for the same folder replaces the pending setup.
