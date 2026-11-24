@@ -2,9 +2,13 @@ import { spawn } from "node:child_process";
 import { randomBytes, timingSafeEqual } from "node:crypto";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
-import { join } from "node:path";
+import { readdir, stat } from "node:fs/promises";
+import { homedir } from "node:os";
+import { dirname, isAbsolute, join, resolve } from "node:path";
 import type { Relay } from "./relay.js";
+import { teamSetupSchema } from "./types.js";
 
+const clientNames = { codex: "Codex", antigravity: "Antigravity", claude: "Claude Code" };
 function equalToken(expected: string, received: string): boolean {
   if (!/^[a-f0-9]{32}$/.test(received)) return false;
   return timingSafeEqual(Buffer.from(expected, "hex"), Buffer.from(received, "hex"));
@@ -119,11 +123,6 @@ export class DashboardServer {
     res.setHeader("Cache-Control", "no-store");
     res.setHeader("X-Content-Type-Options", "nosniff");
     res.setHeader("Referrer-Policy", "no-referrer");
-    if (req.method !== "GET") {
-      res.writeHead(405, { "Content-Type": "text/plain; charset=utf-8" });
-      res.end("Method Not Allowed");
-      return;
-    }
     const url = URL.parse(req.url ?? "/", "http://127.0.0.1");
     if (!url) {
       res.writeHead(400, { "Content-Type": "text/plain; charset=utf-8" });
@@ -137,6 +136,16 @@ export class DashboardServer {
       return;
     }
     const route = match[2] ?? "/";
+    const pickFolder = route === "/api/workspace-picker" && req.method === "POST";
+    if (pickFolder || (route === "/api/setup" && (req.method === "POST" || req.method === "DELETE"))) {
+      void this.handleSetup(req, res, url, pickFolder);
+      return;
+    }
+    if (req.method !== "GET") {
+      res.writeHead(405, { "Content-Type": "text/plain; charset=utf-8" });
+      res.end("Method Not Allowed");
+      return;
+    }
     if (route === "/" || route === "") {
       const nonce = randomBytes(16).toString("base64");
       res.writeHead(200, {
@@ -169,6 +178,76 @@ export class DashboardServer {
     }
     res.writeHead(404, { "Content-Type": "text/plain; charset=utf-8" });
     res.end("Not Found");
+  }
+
+  private async handleSetup(req: IncomingMessage, res: ServerResponse, url: URL, pickFolder: boolean): Promise<void> {
+    const respond = (status: number, data: unknown) => {
+      res.writeHead(status, { "Content-Type": "application/json; charset=utf-8" });
+      res.end(JSON.stringify(data));
+    };
+    if (req.headers.origin !== new URL(this.addressUrl!).origin) {
+      req.resume();
+      respond(403, { error: "Open team setup from the local dashboard." });
+      return;
+    }
+    if (pickFolder) {
+      req.resume();
+      const requested = url.searchParams.get("path") || process.cwd();
+      if (!isAbsolute(requested) || (process.platform === "win32" && !/^[a-z]:[\\/]/i.test(requested))) {
+        respond(400, { error: "Choose a folder on a local drive." });
+        return;
+      }
+      const workspace = resolve(requested);
+      try {
+        const entries = await readdir(workspace, { withFileTypes: true });
+        const folders = entries.filter((entry) => entry.isDirectory())
+          .map((entry) => ({ name: entry.name, path: join(workspace, entry.name) }))
+          .sort((left, right) => left.name.localeCompare(right.name));
+        const drives = process.platform === "win32"
+          ? await Promise.all(Array.from({ length: 26 }, async (_, index) => {
+              const root = String.fromCharCode(65 + index) + ":\\";
+              return (await stat(root).catch(() => undefined))?.isDirectory() ? root : null;
+            }))
+          : ["/"];
+        const parent = dirname(workspace);
+        respond(200, { workspace, parent: parent === workspace ? null : parent, home: homedir(), drives: drives.filter(Boolean), folders });
+      } catch {
+        if (!res.destroyed) respond(400, { error: "Unable to read that folder. Try its parent or another drive." });
+      }
+      return;
+    }
+    if (req.method === "DELETE") {
+      req.resume();
+      const canceled = this.relay.cancelTeamSetup(url.searchParams.get("id") ?? "");
+      respond(canceled ? 200 : 404, canceled ? { canceled } : { error: "This setup has already changed." });
+      return;
+    }
+    if (req.headers["content-type"]?.split(";")[0] !== "application/json") {
+      req.resume();
+      respond(415, { error: "Send the team setup as JSON." });
+      return;
+    }
+    try {
+      let size = 0;
+      const chunks: Buffer[] = [];
+      for await (const chunk of req.iterator({ destroyOnReturn: false })) {
+        size += chunk.length;
+        if (size > 32_768) {
+          req.resume();
+          respond(413, { error: "Team setup is too large." });
+          return;
+        }
+        chunks.push(chunk);
+      }
+      const parsed = teamSetupSchema.safeParse(JSON.parse(Buffer.concat(chunks).toString("utf8")));
+      if (!parsed.success) {
+        respond(400, { error: parsed.error.issues[0].message });
+        return;
+      }
+      respond(201, this.relay.saveTeamSetup(parsed.data));
+    } catch (error) {
+      if (!res.destroyed) respond(400, { error: error instanceof Error ? error.message : "Unable to save team setup." });
+    }
   }
 }
 
@@ -810,6 +889,38 @@ function dashboardHtml(token: string, nonce: string): string {
     @media (prefers-reduced-motion: reduce) {
       *, *::before, *::after { animation: none !important; transition: none !important; }
     }
+    .setup-panel { margin-bottom: 20px; }
+    .setup-panel summary { cursor: pointer; font-weight: 800; }
+    .setup-fields {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(min(135px, 100%), 1fr));
+      gap: 12px;
+      margin: 14px 0;
+    }
+    .setup-fields label { display: grid; gap: 5px; font-size: 0.86rem; font-weight: 700; min-width: 0; }
+    .setup-workspace { grid-column: 1 / -1; }
+    .setup-path { display: flex; gap: 8px; }
+    .folder-picker { width: min(620px, calc(100% - 24px)); color: var(--ink); }
+    .folder-picker::backdrop { background: rgba(17, 16, 27, 0.7); }
+    .folder-picker h2 { margin-top: 0; }
+    .folder-picker .task-list { max-height: min(42vh, 360px); }
+    .folder-picker .task-list button { border-radius: 10px; text-align: left; overflow-wrap: anywhere; }
+    .folder-actions { margin-top: 14px; }
+    #folderStatus:empty { display: none; }
+    .setup-fields input, .setup-fields select {
+      min-width: 0;
+      width: 100%;
+      font: inherit;
+      color: var(--ink);
+      background: var(--surface-2);
+      border: 2px solid var(--border);
+      border-radius: 10px;
+      padding: 7px 10px;
+    }
+    .setup-list:empty { display: none; }
+    .setup-row { border-top: 1px solid var(--border); padding: 12px 0; overflow-wrap: anywhere; }
+    .setup-row p { margin: 5px 0 9px; color: var(--muted); }
+    .setup-status { color: var(--muted); }
   </style>
 </head>
 <body>
@@ -840,16 +951,57 @@ function dashboardHtml(token: string, nonce: string): string {
       </div>
     </header>
 
+    <details class="panel setup-panel" open>
+      <summary>Set up a team</summary>
+      <form id="setupForm">
+        <div class="setup-fields">
+          <div class="setup-workspace">
+            <label for="setupWorkspace">Workspace folder</label>
+            <div class="setup-path">
+              <input id="setupWorkspace" name="workspace" required maxlength="4000" placeholder="Absolute path to your project" />
+              ${process.platform === "win32" ? '<button class="btn" id="browseWorkspace" type="button">Browse…</button>' : ""}
+            </div>
+          </div>
+          <label>Orchestrator
+            <select name="leadProfile">${Object.entries(clientNames).map(([profile, label]) =>
+              `<option value="${profile}">${label}</option>`).join("")}</select>
+          </label>
+          ${Object.entries(clientNames).map(([profile, label]) =>
+            `<label>${label} workers<input name="${profile}" type="number" value="${profile === "antigravity" ? 1 : 0}" min="0" max="63" step="1" required /></label>`).join("")}
+        </div>
+        <div class="controls">
+          <button class="btn" type="submit">Save team setup</button>
+          <span class="setup-status" id="setupStatus" role="status"></span>
+        </div>
+      </form>
+      <div class="setup-list" id="setupList"></div>
+    </details>
+    <dialog class="panel folder-picker" id="folderPicker" aria-labelledby="folderTitle">
+      <h2 id="folderTitle">Choose workspace folder</h2>
+      <div class="controls">
+        <button class="btn" id="folderUp" type="button">Up</button>
+        <button class="btn" id="folderHome" type="button">Home</button>
+        <select class="run-select" id="folderDrive" aria-label="Drive"></select>
+      </div>
+      <p class="workspace-path" id="folderLocation"></p>
+      <p id="folderStatus" role="status"></p>
+      <div class="task-list" id="folderEntries"></div>
+      <div class="controls folder-actions">
+        <button class="btn active-toggle" id="chooseFolder" type="button" disabled>Use this folder</button>
+        <button class="btn" id="cancelFolder" type="button">Cancel</button>
+      </div>
+    </dialog>
     <main id="app"></main>
   </div>
   <div class="toast" id="toast" role="status" aria-live="polite"></div>
 
   <script nonce="${nonce}">
     const BASE = ${JSON.stringify(base)};
+    const CLIENT_NAMES = ${JSON.stringify(clientNames)};
     const WORKER_PROMPT = "Use the Agent Pair skill to join the team waiting in this workspace. Follow your assigned tasks and file boundaries, and report blockers and handoffs to the orchestrator.";
-    const ORCH_PROMPT = "Use the Agent Pair skill to orchestrate this workspace's plan.md. Ask me how many additional workers I want and which clients they should use. Start the team and tell me when it's waiting.";
+    const ORCH_PROMPT = "Use the Agent Pair skill to orchestrate this workspace's plan.md. Check the dashboard team setup first. If there is no setup, ask me how many additional workers I want and which clients they should use. Start the team and tell me when it's waiting.";
 
-    let snapshot = { now: Date.now(), runs: [], pendingPairs: [] };
+    let snapshot = { now: Date.now(), runs: [], pendingPairs: [], setups: [] };
     let selectedRunId = null;
     let taskFilter = "all";
     let demoMode = false;
@@ -864,6 +1016,126 @@ function dashboardHtml(token: string, nonce: string): string {
     const themeBtn = document.getElementById("themeBtn");
     const soundBtn = document.getElementById("soundBtn");
     const toastEl = document.getElementById("toast");
+    const setupForm = document.getElementById("setupForm");
+    const setupStatus = document.getElementById("setupStatus");
+    const setupList = document.getElementById("setupList");
+    const workspaceInput = document.getElementById("setupWorkspace");
+    const picker = document.getElementById("folderPicker");
+    const folderStatus = document.getElementById("folderStatus");
+    const folderLocation = document.getElementById("folderLocation");
+    const folderEntries = document.getElementById("folderEntries");
+    const folderUp = document.getElementById("folderUp");
+    const folderHome = document.getElementById("folderHome");
+    const folderDrive = document.getElementById("folderDrive");
+    const chooseFolder = document.getElementById("chooseFolder");
+    let currentFolder;
+    let folderRequest;
+
+    async function browseFolder(path = "") {
+      folderRequest?.abort();
+      const request = new AbortController();
+      folderRequest = request;
+      folderStatus.textContent = "Loading folders?";
+      chooseFolder.disabled = true;
+      try {
+        const response = await fetch(BASE + "/api/workspace-picker?path=" + encodeURIComponent(path), {
+          method: "POST", signal: request.signal,
+        });
+        const result = await response.json();
+        if (request.signal.aborted) return;
+        if (!response.ok) throw new Error(result.error);
+        currentFolder = result;
+        folderLocation.textContent = result.workspace;
+        folderUp.disabled = !result.parent;
+        folderDrive.replaceChildren(new Option("Drives", ""));
+        for (const drive of result.drives) folderDrive.add(new Option(drive, drive));
+        folderEntries.replaceChildren(...result.folders.map((folder) => {
+          const button = document.createElement("button");
+          button.type = "button";
+          button.className = "btn";
+          button.textContent = folder.name;
+          button.addEventListener("click", () => browseFolder(folder.path));
+          return button;
+        }));
+        folderStatus.textContent = result.folders.length ? "" : "No subfolders.";
+      } catch (error) {
+        if (!request.signal.aborted) folderStatus.textContent = error.message;
+      } finally {
+        if (!request.signal.aborted) chooseFolder.disabled = !currentFolder;
+      }
+    }
+
+    document.getElementById("browseWorkspace").addEventListener("click", () => {
+      picker.showModal();
+      void browseFolder(workspaceInput.value.trim() || currentFolder?.workspace);
+    });
+    folderUp.addEventListener("click", () => { if (currentFolder?.parent) void browseFolder(currentFolder.parent); });
+    folderHome.addEventListener("click", () => { void browseFolder(currentFolder?.home); });
+    folderDrive.addEventListener("change", () => { if (folderDrive.value) void browseFolder(folderDrive.value); });
+    chooseFolder.addEventListener("click", () => {
+      workspaceInput.value = currentFolder.workspace;
+      picker.close();
+    });
+    document.getElementById("cancelFolder").addEventListener("click", () => picker.close());
+    picker.addEventListener("close", () => folderRequest?.abort());
+
+    async function updateSetup(method, value) {
+      const url = BASE + "/api/setup" + (method === "DELETE" ? "?id=" + encodeURIComponent(value) : "");
+      const response = await fetch(url, method === "DELETE" ? { method } : {
+        method, headers: { "Content-Type": "application/json" }, body: JSON.stringify(value),
+      });
+      const result = await response.json();
+      if (!response.ok) throw new Error(result.error);
+      return result;
+    }
+
+    setupForm.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      const button = event.submitter;
+      button.disabled = true;
+      setupStatus.textContent = "Saving…";
+      const fields = new FormData(setupForm);
+      const workers = Object.fromEntries(Object.keys(CLIENT_NAMES).map((profile) => [profile, Number(fields.get(profile))]));
+      try {
+        await updateSetup("POST", { workspace: fields.get("workspace").trim(), leadProfile: fields.get("leadProfile"), workers });
+        setupStatus.textContent = "Setup saved. Open the selected orchestrator in the workspace.";
+      } catch (error) {
+        setupStatus.textContent = error.message;
+      } finally {
+        button.disabled = false;
+      }
+    });
+
+    setupList.addEventListener("click", async (event) => {
+      const copy = event.target.closest("[data-setup-copy]");
+      if (copy) {
+        void copyText("Use the Agent Pair skill. Look up the saved dashboard team setup for this workspace, use it to orchestrate plan.md, and tell me when workers can join.", "Orchestrator prompt copied.");
+        return;
+      }
+      const cancel = event.target.closest("[data-setup-cancel]");
+      if (!cancel) return;
+      try {
+        await updateSetup("DELETE", cancel.dataset.setupCancel);
+        setupStatus.textContent = "Setup canceled.";
+      } catch (error) {
+        setupStatus.textContent = error.message;
+      }
+    });
+
+    let renderedSetups = "";
+    function renderSetups(setups) {
+      const fingerprint = JSON.stringify(setups);
+      if (fingerprint === renderedSetups) return;
+      renderedSetups = fingerprint;
+      setupList.innerHTML = setups.map((setup) => {
+        const workers = Object.entries(setup.workers).filter(([, count]) => count > 0)
+          .map(([profile, count]) => count + " " + CLIENT_NAMES[profile]).join(", ");
+        return '<article class="setup-row"><strong>' + esc(setup.workspace) + '</strong>' +
+          '<p>Waiting for ' + esc(CLIENT_NAMES[setup.leadProfile]) + ' to orchestrate. Workers: ' + esc(workers) + '.</p>' +
+          '<div class="controls"><button class="btn" data-setup-copy type="button">Copy Orchestrator Prompt</button>' +
+          '<button class="btn" data-setup-cancel="' + esc(setup.id) + '" type="button">Cancel setup</button></div></article>';
+      }).join("");
+    }
 
     let savedTheme;
     try {
@@ -1343,6 +1615,7 @@ function dashboardHtml(token: string, nonce: string): string {
         if (lastEventKey && key !== lastEventKey) playPop(440);
         lastEventKey = key;
         snapshot = next;
+        renderSetups(next.setups);
         connDot.classList.remove("offline");
         connText.textContent = "Live";
         render();

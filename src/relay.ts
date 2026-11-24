@@ -2,7 +2,7 @@ import { randomBytes, randomUUID } from "node:crypto";
 import { basename } from "node:path";
 import { saveBookmark, saveSessions } from "./bookmarks.js";
 import { leader, Team } from "./team.js";
-import { otherRole, type PairRole, type Request, type Role } from "./types.js";
+import { otherRole, roles, type PairRole, type Request, type Role, type TeamSetupInput } from "./types.js";
 import { pathKey, workspaceRoot } from "./workspace.js";
 
 export type AgentActivityState =
@@ -74,7 +74,10 @@ export type DashboardSnapshot = {
   now: number;
   runs: DashboardRun[];
   pendingPairs: { workspace: string; workspaceName: string; role: PairRole }[];
+  setups: TeamSetup[];
 };
+
+type TeamSetup = TeamSetupInput & { id: string; expiresAt: number };
 
 type ConnectionRequest = Extract<Request, { action: "connect" }>;
 type Send = Extract<Request, { action: "send" }>;
@@ -130,6 +133,7 @@ export class Relay {
   private readonly handles = new Map<string, { role: Role; member: string; run: Run }>();
   private readonly pending = new Map<string, Waiting>();
   private readonly observers = new Set<() => void>();
+  private readonly setups = new Map<string, TeamSetup>();
   private readonly lifetime = 30 * 60 * 1000;
 
   constructor(private readonly directory: string, private readonly now: () => number = Date.now) {}
@@ -257,17 +261,47 @@ export class Relay {
       workspaceName: basename(entry.workspace) || entry.workspace,
       role: entry.role,
     }));
-    return { now: this.now(), runs, pendingPairs };
+    return { now: this.now(), runs, pendingPairs, setups: [...this.setups.values()] };
   }
 
   sweep(): void {
+    let setupExpired = false;
+    for (const [key, setup] of this.setups) {
+      if (setup.expiresAt > this.now()) continue;
+      this.setups.delete(key);
+      setupExpired = true;
+    }
+    if (setupExpired) this.notifyObservers();
     for (const run of this.runs.values()) {
       if (run.expires <= this.now()) this.close(run.id);
     }
   }
 
   get idle(): boolean {
-    return this.runs.size === 0 && this.pending.size === 0;
+    return this.runs.size === 0 && this.pending.size === 0 && this.setups.size === 0;
+  }
+
+  saveTeamSetup(input: TeamSetupInput): TeamSetup {
+    const workspace = workspaceRoot(input.workspace);
+    const key = pathKey(workspace);
+    this.sweep();
+    if ([...this.runs.values()].some((run) => run.team && pathKey(run.workspace) === key)) {
+      throw new Error("Close the active team in this workspace before setting up another.");
+    }
+    const setup = { ...input, workspace, id: randomUUID(), expiresAt: this.now() + this.lifetime };
+    this.setups.set(key, setup);
+    this.notifyObservers();
+    return setup;
+  }
+
+  cancelTeamSetup(id: string): boolean {
+    for (const [key, setup] of this.setups) {
+      if (setup.id !== id) continue;
+      this.setups.delete(key);
+      this.notifyObservers();
+      return true;
+    }
+    return false;
   }
 
   async execute(request: Request, signal: AbortSignal): Promise<unknown> {
@@ -276,6 +310,10 @@ export class Relay {
     if (request.action === "dashboard") return this.snapshot();
     if (request.action === "close") return this.close(request.runId);
     if (request.action === "connect") return this.connect(request, signal);
+    if (request.action === "teamSetup") {
+      const workspace = workspaceRoot(request.workspace);
+      return { currentProfile: request.role, setup: this.setups.get(pathKey(workspace)) ?? null };
+    }
     if (request.action === "teamStart") return this.startTeam(request);
     if (request.action === "teamJoin") return this.joinTeam(request);
 
@@ -429,7 +467,19 @@ export class Relay {
 
   private startTeam(request: Extract<Request, { action: "teamStart" }>) {
     const workspace = workspaceRoot(request.workspace);
+    const key = pathKey(workspace);
+    const setup = this.setups.get(key);
+    if (setup?.id !== request.setupId) throw new Error("The dashboard setup changed. Call team_setup for the current selection.");
+    if (setup && setup.leadProfile !== request.role) throw new Error(`This setup requires a ${setup.leadProfile} orchestrator.`);
     const team = new Team(request.role, request.sessionId, request.assignments, request.workerCount, request.allowedProfiles);
+    if (setup) {
+      const workerProfiles = [...team.members].flatMap(([id, slot]) => id === leader ? [] : [slot.profile]);
+      if (roles.some((role) => workerProfiles.filter((profile) => profile === role).length !== setup.workers[role]
+        || team.allowedProfiles.includes(role) !== (setup.workers[role] > 0))) {
+        throw new Error("Worker slots and allowed profiles must match the dashboard setup.");
+      }
+      this.setups.delete(key);
+    }
     const run = this.createRun(workspace, team);
     const handle = this.addMember(run, leader, request.role);
     this.notifyObservers();

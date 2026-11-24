@@ -31,7 +31,13 @@ The relay validates overlapping file and directory assignments across owners and
 
 ### Live browser dashboard
 
-When a team starts, Agent Pair opens a local browser dashboard with task progress, agent activity recorded by the relay, live messages, and the four-character resume tag. Run `agent-pair dashboard` to open it manually, or `agent-pair dashboard --no-open` to print its link. Set `AGENT_PAIR_DASHBOARD=0` in the orchestrator's environment to disable automatic opening. The dashboard link grants read access to active runs on this local relay.
+To configure a run in the browser, open `agent-pair dashboard` and use **Set up a team**. Enter the absolute project folder, choose an orchestrator, and set the number of additional workers per client. Save the setup and copy its orchestrator prompt into a fresh session of the selected client in that folder. Once the orchestrator starts the team, open the worker sessions in the same folder and give each the generic worker prompt. The dashboard shows assignments and dependencies as soon as the orchestrator starts the run.
+
+A saved setup expires after 30 minutes. Saving again for the same folder replaces the pending setup.
+
+On Windows, click **Browse…** next to **Workspace folder** to choose a folder. You can also type its absolute path.
+
+When a team starts, Agent Pair opens a local browser dashboard with task progress, agent activity recorded by the relay, live messages, and the four-character resume tag. Run `agent-pair dashboard` to open it manually, or `agent-pair dashboard --no-open` to print its link. Set `AGENT_PAIR_DASHBOARD=0` in the orchestrator's environment to disable automatic opening. The dashboard link gives access to pending setups and active runs on this local relay.
 
 ## Pair Codex and Antigravity
 

@@ -13,7 +13,7 @@ import { dataDirectory, pathKey } from "./workspace.js";
 const maxFrame = 1024 * 1024;
 
 function endpoint(directory: string): string {
-  const hash = createHash("sha256").update("agent-pair-relay-v4\0").update(pathKey(directory)).digest("hex").slice(0, 24);
+  const hash = createHash("sha256").update("agent-pair-relay-v7\0").update(pathKey(directory)).digest("hex").slice(0, 24);
   if (process.platform === "win32") return `\\\\.\\pipe\\agent-pair-${hash}`;
   if (process.platform === "linux") return `\0agent-pair-${hash}`;
   return join(tmpdir(), `agent-pair-${hash}.sock`);

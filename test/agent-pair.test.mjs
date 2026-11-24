@@ -14,7 +14,7 @@ import { Relay } from "../dist/relay.js";
 import { pathKey } from "../dist/workspace.js";
 
 const entry = fileURLToPath(new URL("../dist/cli.js", import.meta.url));
-const toolNames = ["pair_connect", "team_start", "team_join", "team_update", "pair_send", "pair_inbox", "pair_ack", "pair_status", "pair_disconnect"];
+const toolNames = ["pair_connect", "team_setup", "team_start", "team_join", "team_update", "pair_send", "pair_inbox", "pair_ack", "pair_status", "pair_disconnect"];
 
 function fixture(t) {
   const parent = realpathSync(tmpdir());
@@ -413,17 +413,34 @@ test("serves a token-gated local browser dashboard with live SSE team state upda
 
   const initial = await nextSnapshot();
   assert.deepEqual(initial.runs, []);
+  assert.deepEqual(initial.setups, []);
+
+  const setupInput = { workspace, leadProfile: "codex", workers: { codex: 0, antigravity: 1, claude: 0 } };
+  const postSetup = (input, requestOrigin = origin) => fetch(`${url}api/setup`, {
+    method: "POST", headers: { origin: requestOrigin, "Content-Type": "application/json" }, body: JSON.stringify(input),
+  });
+  assert.equal((await postSetup(setupInput, "http://example.test")).status, 403);
+  assert.equal((await postSetup({ ...setupInput, workers: { codex: 63, antigravity: 1, claude: 0 } })).status, 400);
+  const saved = await postSetup(setupInput);
+  assert.equal(saved.status, 201);
+  const setup = await saved.json();
+  assert.equal((await nextSnapshot()).setups[0].id, setup.id);
+  assert.deepEqual(await tool(lead, "team_setup", { workspace }), { currentProfile: "codex", setup });
 
   const assignments = [
     { id: "api", owner: "orchestrator", profile: "codex", title: "Build API", paths: ["src/api/"], checks: ["API tests pass"] },
     { id: "ui", owner: "frontend", profile: "antigravity", title: "Build UI", paths: ["src/ui/"], checks: ["UI renders"] },
   ];
-  const run = await tool(lead, "team_start", {
-    workspace, sessionId: randomUUID(), workerCount: 1, allowedProfiles: ["antigravity"], assignments,
-  });
+  const startArgs = { workspace, setupId: setup.id, sessionId: randomUUID(), workerCount: 1, allowedProfiles: ["antigravity"], assignments };
+  await assert.rejects(tool(agy, "team_start", startArgs), /requires a codex orchestrator/);
+  await assert.rejects(tool(lead, "team_start", {
+    ...startArgs, allowedProfiles: ["claude"], assignments: [assignments[0], { ...assignments[1], profile: "claude" }],
+  }), /must match the dashboard setup/);
+  const run = await tool(lead, "team_start", startArgs);
   assert.equal(run.dashboardUrl, undefined);
   const afterStart = await nextSnapshot();
   assert.equal(afterStart.runs.length, 1);
+  assert.deepEqual(afterStart.setups, []);
   assert.equal(afterStart.runs[0].members.find((m) => m.member === "frontend").status, "waiting");
 
   const worker = await tool(agy, "team_join", { workspace, sessionId: randomUUID() });

@@ -38,6 +38,7 @@ Workers can start independent tasks in parallel. A dependent task becomes eligib
 
 | MCP tool | Behavior |
 | --- | --- |
+| `team_setup` | Read the pending dashboard setup for the current workspace. |
 | `team_start` | Create a fresh team with the selected worker count, profiles, and assignments. |
 | `team_join` | Claim an available slot for your client in the same workspace and retrieve its assignments. |
 | `team_update` | Start, block, or hand off owned work, or accept or request revisions as orchestrator. |
