@@ -273,6 +273,7 @@ export class Relay {
   async execute(request: Request, signal: AbortSignal): Promise<unknown> {
     this.sweep();
     if (request.action === "ping") return { available: true };
+    if (request.action === "dashboard") return this.snapshot();
     if (request.action === "close") return this.close(request.runId);
     if (request.action === "connect") return this.connect(request, signal);
     if (request.action === "teamStart") return this.startTeam(request);

@@ -5,6 +5,7 @@ import { createConnection, createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
+import { DashboardServer, openDashboardUrl } from "./dashboard.js";
 import { Relay } from "./relay.js";
 import { requestSchema, type Request } from "./types.js";
 import { dataDirectory, pathKey } from "./workspace.js";
@@ -12,7 +13,7 @@ import { dataDirectory, pathKey } from "./workspace.js";
 const maxFrame = 1024 * 1024;
 
 function endpoint(directory: string): string {
-  const hash = createHash("sha256").update("agent-pair-relay-v3\0").update(pathKey(directory)).digest("hex").slice(0, 24);
+  const hash = createHash("sha256").update("agent-pair-relay-v4\0").update(pathKey(directory)).digest("hex").slice(0, 24);
   if (process.platform === "win32") return `\\\\.\\pipe\\agent-pair-${hash}`;
   if (process.platform === "linux") return `\0agent-pair-${hash}`;
   return join(tmpdir(), `agent-pair-${hash}.sock`);
@@ -46,6 +47,7 @@ export async function runBroker(): Promise<void> {
   const directory = dataDirectory();
   const secret = await brokerSecret(directory);
   const relay = new Relay(directory);
+  const dashboard = new DashboardServer(relay);
   let lastCall = Date.now();
   const server = createServer((socket) => {
     const controller = new AbortController();
@@ -70,7 +72,23 @@ export async function runBroker(): Promise<void> {
         const request = requestSchema.safeParse(packet.request);
         if (!request.success) throw new Error("Invalid relay request.");
         lastCall = Date.now();
-        const data = await relay.execute(request.data, controller.signal);
+        let data: unknown;
+        if (request.data.action === "dashboard") {
+          data = { url: await dashboard.ensureStarted() };
+        } else {
+          data = await relay.execute(request.data, controller.signal);
+          const allowAutoOpen = request.data.action === "teamStart"
+            && !request.data.noDashboard;
+          if (allowAutoOpen && data && typeof data === "object") {
+            try {
+              const url = await dashboard.ensureStarted();
+              (data as Record<string, unknown>).dashboardUrl = url;
+              if (!dashboard.hasClients) openDashboardUrl(url);
+            } catch {
+              // Dashboard launch is optional and must not interrupt team startup.
+            }
+          }
+        }
         if (!socket.destroyed) socket.end(JSON.stringify({ data }) + "\n");
       } catch (error) {
         const message = error instanceof Error ? error.message : "Agent Pair relay request failed.";
@@ -89,9 +107,12 @@ export async function runBroker(): Promise<void> {
   if (!server.listening) return;
   const timer = setInterval(() => {
     relay.sweep();
-    if (relay.idle && Date.now() - lastCall > 60_000) server.close();
+    if (relay.idle && !dashboard.hasClients && Date.now() - lastCall > 60_000) server.close();
   }, 5000);
-  server.once("close", () => clearInterval(timer));
+  server.once("close", () => {
+    clearInterval(timer);
+    dashboard.close();
+  });
 }
 
 function call(path: string, secret: string, request: Request, signal?: AbortSignal): Promise<unknown> {

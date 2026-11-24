@@ -24,10 +24,16 @@ export async function serve(entry: string, role: Role): Promise<void> {
     description: "Start a fresh pair with the other agent in the current workspace.",
     inputSchema: connectFields,
   }, (input, extra) => invoke({ action: "connect", role, ...input }, extra.signal));
+  const suppressDashboard = process.env.AGENT_PAIR_NO_DASHBOARD === "1" || process.env.AGENT_PAIR_DASHBOARD === "0";
   server.registerTool("team_start", {
     description: `Your current client profile is ${role}. Start a fresh team after asking the user how many additional worker sessions they want under you (total sessions = workerCount + 1) and which client profiles those workers should use. Include your sessionId from Agent Pair session-start metadata when available so a 4-character resume tag is saved once all workers join. Assign each worker slot an allowed profile and owned tasks. Workers join from the same workspace without individual invitations.`,
     inputSchema: teamStartFields,
-  }, (input, extra) => invoke({ action: "teamStart", role, ...input }, extra.signal));
+  }, (input, extra) => invoke({
+    action: "teamStart",
+    role,
+    ...(suppressDashboard ? { noDashboard: true } : {}),
+    ...input,
+  }, extra.signal));
   server.registerTool("team_join", {
     description: "Join the waiting team in the current workspace using this session's client profile. Include your sessionId from Agent Pair session-start metadata when available so the 4-character resume tag can be saved once all members join. Include runId only if multiple teams are active. Returns this worker's tasks and owned paths.",
     inputSchema: teamJoinFields,

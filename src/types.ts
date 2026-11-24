@@ -69,7 +69,7 @@ export const statusFields = { handle, taskId: identifier.optional(), waitMs: inb
 export const disconnectFields = { handle };
 export const requestSchema = z.discriminatedUnion("action", [
   z.object({ action: z.literal("connect"), role: roleSchema, ...connectFields }),
-  z.object({ action: z.literal("teamStart"), role: roleSchema, ...teamStartFields }),
+  z.object({ action: z.literal("teamStart"), role: roleSchema, noDashboard: z.boolean().optional(), ...teamStartFields }),
   z.object({ action: z.literal("teamJoin"), role: roleSchema, ...teamJoinFields }),
   z.object({ action: z.literal("teamUpdate"), role: roleSchema, ...teamUpdateFields }),
   z.object({ action: z.literal("send"), role: roleSchema, ...sendFields }),

@@ -24,10 +24,17 @@ export async function doctor(entry: string, profiles: readonly Role[] = pairRole
 
   const workspace = mkdtempSync(join(tmpdir(), "agent-pair-doctor-"));
   const workerProfiles = profiles.length === 1 ? profiles : profiles.slice(1);
-  const clients = [profiles[0], ...workerProfiles].map((role) => ({
-    client: new Client({ name: `agent-pair-doctor-${role}`, version: "0.2.1" }),
-    transport: new StdioClientTransport({ ...registration(entry, role), stderr: "ignore" }),
-  }));
+  const clients = [profiles[0], ...workerProfiles].map((role) => {
+    const reg = registration(entry, role);
+    return {
+      client: new Client({ name: `agent-pair-doctor-${role}`, version: "0.2.1" }),
+      transport: new StdioClientTransport({
+        ...reg,
+        env: { ...reg.env, AGENT_PAIR_NO_DASHBOARD: "1" },
+        stderr: "ignore",
+      }),
+    };
+  });
   const invoke = async (index: number, name: string, args: Record<string, unknown>) => {
     const output = await clients[index].client.callTool({ name, arguments: args });
     const content = output.content;

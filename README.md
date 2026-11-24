@@ -29,6 +29,10 @@ Open the requested worker sessions in the same workspace and give each the same 
 
 The relay validates overlapping file and directory assignments across owners and requires accepted dependencies before a task can start. Agents enforce the agreed file ownership when they edit. Workers hand off their changes and check results to the orchestrator for review. This version supports up to 64 tasks per team and up to 64 sessions when tasks have distinct owners, including the orchestrator.
 
+### Live browser dashboard
+
+When a team starts, Agent Pair opens a local browser dashboard with task progress, agent activity recorded by the relay, live messages, and the four-character resume tag. Run `agent-pair dashboard` to open it manually, or `agent-pair dashboard --no-open` to print its link. Set `AGENT_PAIR_DASHBOARD=0` in the orchestrator's environment to disable automatic opening. The dashboard link grants read access to active runs on this local relay.
+
 ## Pair Codex and Antigravity
 
 Open the same folder in fresh Codex and Antigravity sessions and give both the same prompt.

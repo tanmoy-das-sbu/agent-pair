@@ -4,6 +4,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
 import { captureSession } from "./capture.js";
+import { openDashboardUrl } from "./dashboard.js";
 import { relayCall, runBroker } from "./ipc.js";
 import { launchResume, resumePlan } from "./resume.js";
 import { applySetup, setupPlan } from "./setup.js";
@@ -17,6 +18,7 @@ const help = `Agent Pair connects fresh Codex, Antigravity, and Claude Code sess
   agent-pair setup --apply     Install into Codex and Antigravity by default
   agent-pair doctor           Check setup and the MCP message round trip
   agent-pair init             Create plan.md from the project template
+  agent-pair dashboard        Open the live browser dashboard for active teams
   agent-pair resume <tag>     Open the bookmarked native sessions
   agent-pair close <run-id>   Close a live run
 
@@ -30,6 +32,7 @@ async function main(): Promise<void> {
     options: {
       "dry-run": { type: "boolean" },
       apply: { type: "boolean" },
+      "no-open": { type: "boolean" },
       profile: { type: "string" },
       profiles: { type: "string" },
       help: { type: "boolean", short: "h" },
@@ -77,6 +80,14 @@ async function main(): Promise<void> {
     case "close": {
       const request = requestSchema.parse({ action: "close", runId: positionals[0] });
       console.log(JSON.stringify(await relayCall(entry, request)));
+      return;
+    }
+    case "dashboard": {
+      const result = await relayCall(entry, { action: "dashboard" }) as { url: string };
+      if (!values["no-open"] && process.env.AGENT_PAIR_NO_DASHBOARD !== "1") {
+        openDashboardUrl(result.url);
+      }
+      console.log(result.url);
       return;
     }
     case "resume": {

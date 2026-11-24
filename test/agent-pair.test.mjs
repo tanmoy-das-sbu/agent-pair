@@ -26,6 +26,7 @@ function fixture(t) {
     ...process.env,
     AGENT_PAIR_CONFIG_HOME: join(directory, "config"),
     AGENT_PAIR_DATA_DIR: join(directory, "data"),
+    AGENT_PAIR_NO_DASHBOARD: "1",
   };
   function command(args, options = {}) {
     return execFileSync(process.execPath, [entry, ...args], {
@@ -363,4 +364,88 @@ test("canceled joins cannot match and expired pairings revoke each handle", asyn
     }, live.signal), /pairing has ended/);
   }
   assert.equal(relay.idle, true);
+});
+
+test("serves a token-gated local browser dashboard with live SSE team state updates", { timeout: 20_000 }, async (t) => {
+  const { directory, env, command } = fixture(t);
+  const workspace = join(directory, "Studio Project");
+  mkdirSync(workspace);
+  const [lead, agy] = await Promise.all([openClient("codex", env), openClient("antigravity", env)]);
+  t.after(() => Promise.all([lead.close(), agy.close()]));
+
+  const url = command(["dashboard", "--no-open"]).trim();
+  assert.match(url, /^http:\/\/127\.0\.0\.1:\d+\/d\/[a-f0-9]{32}\/$/);
+  const origin = new URL(url).origin;
+  assert.equal((await fetch(`${origin}/`)).status, 403);
+  assert.equal((await fetch(`${origin}/d/${"0".repeat(32)}/api/state`)).status, 403);
+
+  const page = await fetch(url);
+  assert.equal(page.status, 200);
+  const html = await page.text();
+  const nonce = /<script nonce="([^"]+)">/.exec(html)?.[1];
+  assert.ok(nonce);
+  assert.ok(page.headers.get("content-security-policy").includes(`script-src 'nonce-${nonce}'`));
+  assert.match(html, /Agent Pair Studio/);
+  assert.match(html, /Cozy Night|Cream Paper/);
+
+  const streamAbort = new AbortController();
+  t.after(() => streamAbort.abort());
+  const eventsResponse = await fetch(`${url}events`, { signal: streamAbort.signal });
+  assert.equal(eventsResponse.status, 200);
+  const reader = eventsResponse.body.getReader();
+  const decoder = new TextDecoder();
+  let sseBuffer = "";
+  const nextSnapshot = async () => {
+    while (true) {
+      const idx = sseBuffer.indexOf("\n\n");
+      if (idx >= 0) {
+        const block = sseBuffer.slice(0, idx);
+        sseBuffer = sseBuffer.slice(idx + 2);
+        const line = block.split("\n").find((entry) => entry.startsWith("data: "));
+        if (line) return JSON.parse(line.slice(6));
+        continue;
+      }
+      const { value, done } = await reader.read();
+      if (done) throw new Error("SSE stream ended unexpectedly.");
+      sseBuffer += decoder.decode(value, { stream: true });
+    }
+  };
+
+  const initial = await nextSnapshot();
+  assert.deepEqual(initial.runs, []);
+
+  const assignments = [
+    { id: "api", owner: "orchestrator", profile: "codex", title: "Build API", paths: ["src/api/"], checks: ["API tests pass"] },
+    { id: "ui", owner: "frontend", profile: "antigravity", title: "Build UI", paths: ["src/ui/"], checks: ["UI renders"] },
+  ];
+  const run = await tool(lead, "team_start", {
+    workspace, sessionId: randomUUID(), workerCount: 1, allowedProfiles: ["antigravity"], assignments,
+  });
+  assert.equal(run.dashboardUrl, undefined);
+  const afterStart = await nextSnapshot();
+  assert.equal(afterStart.runs.length, 1);
+  assert.equal(afterStart.runs[0].members.find((m) => m.member === "frontend").status, "waiting");
+
+  const worker = await tool(agy, "team_join", { workspace, sessionId: randomUUID() });
+  const afterJoin = await nextSnapshot();
+  assert.match(afterJoin.runs[0].tag, /^[A-Z0-9]{4}$/);
+  assert.equal(afterJoin.runs[0].members.find((m) => m.member === "frontend").status, "idle");
+
+  await tool(agy, "team_update", { handle: worker.handle, taskId: "ui", transition: "start" });
+  const afterWorking = await nextSnapshot();
+  assert.equal(afterWorking.runs[0].members.find((m) => m.member === "frontend").status, "working");
+
+  await tool(agy, "team_update", { handle: worker.handle, taskId: "ui", transition: "block", note: "Need palette" });
+  const afterBlocked = await nextSnapshot();
+  assert.equal(afterBlocked.runs[0].members.find((m) => m.member === "frontend").status, "blocked");
+
+  const stateRes = await fetch(`${url}api/state`);
+  assert.equal(stateRes.status, 200);
+  const state = await stateRes.json();
+  assert.equal(state.runs[0].tag, afterJoin.runs[0].tag);
+  assert.equal(state.runs[0].tasks.find((task) => task.id === "ui").note, "Need palette");
+
+  await tool(lead, "pair_disconnect", { handle: run.handle });
+  const afterClose = await nextSnapshot();
+  assert.deepEqual(afterClose.runs, []);
 });
