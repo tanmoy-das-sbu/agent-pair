@@ -1,0 +1,19 @@
+{
+  "id": "02-rest-endpoint",
+  "title": "Build /health and /items REST endpoints",
+  "description": "Implement an in-memory item store and HTTP endpoints GET /health, GET /items, and POST /items with JSON validation.",
+  "soloPrompt": "Complete src/store.mjs and src/server.mjs so GET /health returns 200 {status:'ok'}, GET /items returns 200 {items:[...]}, POST /items validates {name} and returns 201 with the created item, and invalid JSON returns 400.",
+  "teamPlan": [
+    { "id": "store", "owner": "orchestrator", "paths": ["src/store.mjs"], "title": "Implement in-memory ItemStore" },
+    { "id": "http", "owner": "worker-1", "paths": ["src/server.mjs", "test/public.test.mjs"], "title": "Wire REST endpoints and tests" }
+  ],
+  "stubChanges": {
+    "store": {
+      "src/store.mjs": "export class ItemStore {\n  constructor() {\n    this.items = [];\n    this.nextId = 1;\n  }\n  list() {\n    return [...this.items];\n  }\n  add(name) {\n    if (typeof name !== \"string\" || !name.trim()) {\n      throw new Error(\"name is required\");\n    }\n    const item = { id: this.nextId++, name: name.trim() };\n    this.items.push(item);\n    return item;\n  }\n}\n"
+    },
+    "http": {
+      "src/server.mjs": "import { createServer } from \"node:http\";\nimport { ItemStore } from \"./store.mjs\";\n\nexport function createApp(store = new ItemStore()) {\n  return createServer(async (req, res) => {\n    const send = (status, data) => {\n      res.writeHead(status, { \"Content-Type\": \"application/json\" });\n      res.end(JSON.stringify(data));\n    };\n    if (req.method === \"GET\" && req.url === \"/health\") {\n      return send(200, { status: \"ok\" });\n    }\n    if (req.method === \"GET\" && req.url === \"/items\") {\n      return send(200, { items: store.list() });\n    }\n    if (req.method === \"POST\" && req.url === \"/items\") {\n      const chunks = [];\n      for await (const chunk of req) chunks.push(chunk);\n      try {\n        const body = JSON.parse(Buffer.concat(chunks).toString(\"utf8\"));\n        return send(201, store.add(body?.name));\n      } catch (error) {\n        return send(400, { error: error instanceof Error ? error.message : \"Invalid request\" });\n      }\n    }\n    return send(404, { error: \"Not found\" });\n  });\n}\n",
+      "test/public.test.mjs": "import assert from \"node:assert/strict\";\nimport test from \"node:test\";\nimport { ItemStore } from \"../src/store.mjs\";\n\ntest(\"adds items\", () => {\n  const store = new ItemStore();\n  assert.equal(store.add(\"widget\").name, \"widget\");\n});\n"
+    }
+  }
+}

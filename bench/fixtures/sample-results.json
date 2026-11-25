@@ -1,0 +1,47 @@
+{
+  "schemaVersion": 1,
+  "dryRun": false,
+  "syntheticFixture": true,
+  "startedAt": "2026-01-01T00:00:00.000Z",
+  "completedAt": "2026-01-01T00:05:00.000Z",
+  "platform": "fixture",
+  "nodeVersion": "v24.0.0",
+  "results": [
+    {
+      "taskId": "01-cli-flag",
+      "title": "Add --format json CLI flag with tests",
+      "mode": "solo",
+      "dryRun": false,
+      "agent": "fixture-solo",
+      "agentExitCode": 0,
+      "wallTimeMs": 12000,
+      "testsPassed": 3,
+      "testsTotal": 3,
+      "testPassRate": 1,
+      "mergeConflicts": 0,
+      "rejectedHandoffs": 0,
+      "ownershipViolations": 0,
+      "tokens": 2400,
+      "costUsd": 0.018,
+      "status": "passed"
+    },
+    {
+      "taskId": "01-cli-flag",
+      "title": "Add --format json CLI flag with tests",
+      "mode": "team",
+      "dryRun": false,
+      "agent": "fixture-team",
+      "agentExitCode": 0,
+      "wallTimeMs": 9500,
+      "testsPassed": 3,
+      "testsTotal": 3,
+      "testPassRate": 1,
+      "mergeConflicts": 0,
+      "rejectedHandoffs": 1,
+      "ownershipViolations": 1,
+      "tokens": null,
+      "costUsd": null,
+      "status": "passed"
+    }
+  ]
+}

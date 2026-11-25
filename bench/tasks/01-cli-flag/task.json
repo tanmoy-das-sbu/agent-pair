@@ -1,0 +1,19 @@
+{
+  "id": "01-cli-flag",
+  "title": "Add --format json CLI flag with tests",
+  "description": "Extend the starter CLI to support `--format json|text` (default `text`), return non-zero exit code on unsupported format values, and add public tests.",
+  "soloPrompt": "Update src/format.mjs and src/cli.mjs to support `--format json` and `--format text` (default `text`), exit non-zero on invalid format, and add tests in test/public.test.mjs.",
+  "teamPlan": [
+    { "id": "core", "owner": "orchestrator", "paths": ["src/format.mjs", "src/cli.mjs"], "title": "Implement --format flag parsing and JSON formatter" },
+    { "id": "tests", "owner": "worker-1", "paths": ["test/public.test.mjs"], "title": "Add CLI format tests" }
+  ],
+  "stubChanges": {
+    "core": {
+      "src/format.mjs": "export function formatSummary(items, format = \"text\") {\n  if (format === \"json\") {\n    return JSON.stringify({ count: items.length, items });\n  }\n  if (format === \"text\") {\n    return `Count: ${items.length} (${items.join(\", \")})`;\n  }\n  throw new Error(`Unsupported format: ${format}`);\n}\n",
+      "src/cli.mjs": "import { formatSummary } from \"./format.mjs\";\n\nconst args = process.argv.slice(2);\nlet format = \"text\";\nconst items = [];\nfor (let i = 0; i < args.length; i += 1) {\n  if (args[i] === \"--format\") {\n    format = args[i + 1] ?? \"\";\n    i += 1;\n  } else {\n    items.push(args[i]);\n  }\n}\ntry {\n  console.log(formatSummary(items, format));\n} catch (error) {\n  console.error(error instanceof Error ? error.message : String(error));\n  process.exitCode = 1;\n}\n"
+    },
+    "tests": {
+      "test/public.test.mjs": "import assert from \"node:assert/strict\";\nimport test from \"node:test\";\nimport { formatSummary } from \"../src/format.mjs\";\n\ntest(\"formats text and json\", () => {\n  assert.equal(formatSummary([\"a\", \"b\"], \"text\"), \"Count: 2 (a, b)\");\n  assert.deepEqual(JSON.parse(formatSummary([\"a\"], \"json\")), { count: 1, items: [\"a\"] });\n});\n"
+    }
+  }
+}

@@ -1,0 +1,19 @@
+{
+  "id": "03-module-refactor",
+  "title": "Refactor invoice calculator into tax and invoice modules",
+  "description": "Extract pure tax/discount helpers into src/tax.mjs and refactor src/invoice.mjs to validate quantities, round to cents, and compose helpers.",
+  "soloPrompt": "Create src/tax.mjs exporting calculateTax(subtotal, rate) and applyDiscount(amount, percent), and refactor src/invoice.mjs to export calculateInvoice(items, options) rejecting negative quantities and rounding currency to 2 decimals.",
+  "teamPlan": [
+    { "id": "tax", "owner": "orchestrator", "paths": ["src/tax.mjs"], "title": "Extract pure tax and discount helpers" },
+    { "id": "invoice", "owner": "worker-1", "paths": ["src/invoice.mjs", "test/public.test.mjs"], "title": "Refactor calculateInvoice and add tests" }
+  ],
+  "stubChanges": {
+    "tax": {
+      "src/tax.mjs": "export function roundCents(value) {\n  return Math.round((value + Number.EPSILON) * 100) / 100;\n}\nexport function applyDiscount(amount, percent = 0) {\n  if (percent < 0 || percent > 100) throw new Error(\"Invalid discount percent\");\n  return roundCents(amount * (1 - percent / 100));\n}\nexport function calculateTax(subtotal, rate = 0) {\n  if (rate < 0) throw new Error(\"Invalid tax rate\");\n  return roundCents(subtotal * rate);\n}\n"
+    },
+    "invoice": {
+      "src/invoice.mjs": "import { applyDiscount, calculateTax, roundCents } from \"./tax.mjs\";\n\nexport function calculateInvoice(items, { discountPercent = 0, taxRate = 0 } = {}) {\n  let rawSubtotal = 0;\n  for (const item of items) {\n    if (item.qty < 0 || item.unitPrice < 0) throw new Error(\"Negative quantity or price\");\n    rawSubtotal += item.qty * item.unitPrice;\n  }\n  const subtotal = roundCents(rawSubtotal);\n  const discounted = applyDiscount(subtotal, discountPercent);\n  const tax = calculateTax(discounted, taxRate);\n  return { subtotal, discounted, tax, total: roundCents(discounted + tax) };\n}\n",
+      "test/public.test.mjs": "import assert from \"node:assert/strict\";\nimport test from \"node:test\";\nimport { calculateInvoice } from \"../src/invoice.mjs\";\n\ntest(\"calculates invoice total\", () => {\n  assert.equal(calculateInvoice([{ qty: 2, unitPrice: 10 }], { taxRate: 0.1 }).total, 22);\n});\n"
+    }
+  }
+}
