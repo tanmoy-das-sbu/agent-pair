@@ -6,7 +6,14 @@ import { readdir, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import type { DashboardSnapshot, Relay } from "./relay.js";
-import { MetricsTracker, usageReportSchema, type RunMetrics } from "./metrics/index.js";
+import {
+  exportRunHtml,
+  exportRunJson,
+  MetricsTracker,
+  TimelineRecorder,
+  usageReportSchema,
+  type RunMetrics,
+} from "./metrics/index.js";
 import { teamSetupSchema } from "./types.js";
 
 const clientNames = { codex: "Codex", antigravity: "Antigravity", claude: "Claude Code" };
@@ -16,7 +23,7 @@ function equalToken(expected: string, received: string): boolean {
 }
 
 export function openDashboardUrl(url: string): void {
-  if (!/^http:\/\/127\.0\.0\.1:\d+\/d\/[a-f0-9]{32}\/$/.test(url)) return;
+  if (!/^http:\/\/127\.0\.0\.1:\d+\/d\/[a-f0-9]{32}\/(?:\?replay=[a-zA-Z0-9._-]+)?$/.test(url)) return;
   try {
     let child;
     if (process.platform === "win32") {
@@ -49,10 +56,13 @@ export class DashboardServer {
   private addressUrl?: string;
 
   private readonly metrics: MetricsTracker;
+  private readonly timelines: TimelineRecorder;
 
   constructor(private readonly relay: Relay, dataDir?: string) {
     this.metrics = new MetricsTracker(dataDir);
     this.metrics.attach(relay);
+    this.timelines = new TimelineRecorder(dataDir, this.metrics);
+    this.timelines.attach(relay);
   }
 
   get hasClients(): boolean {
@@ -96,6 +106,7 @@ export class DashboardServer {
   }
 
   close(): void {
+    this.timelines.detach();
     this.metrics.detach();
     this.unsubscribe?.();
     this.unsubscribe = undefined;
@@ -197,6 +208,55 @@ export class DashboardServer {
       }
       res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
       res.end(JSON.stringify({ runs: this.metrics.listMetrics() }));
+      return;
+    }
+    if (route === "/api/timelines") {
+      this.timelines.syncSnapshot(this.relay.snapshot());
+      const runs = this.timelines.listTimelines().map((tl) => ({
+        runId: tl.runId,
+        workspaceName: tl.workspaceName,
+        workspace: tl.workspace,
+        tag: tl.tag,
+        eventCount: tl.events.length,
+        createdAt: tl.createdAt,
+        updatedAt: tl.updatedAt,
+        closedAt: tl.closedAt,
+      }));
+      res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
+      res.end(JSON.stringify({ runs }));
+      return;
+    }
+    if (route === "/api/timeline") {
+      this.timelines.syncSnapshot(this.relay.snapshot());
+      const runId = url.searchParams.get("runId") ?? "";
+      const found = runId ? this.timelines.getTimeline(runId) : null;
+      res.writeHead(found ? 200 : 404, { "Content-Type": "application/json; charset=utf-8" });
+      res.end(JSON.stringify(found ?? { error: "Run timeline not found." }));
+      return;
+    }
+    if (route === "/api/export") {
+      this.timelines.syncSnapshot(this.relay.snapshot());
+      const runId = url.searchParams.get("runId") ?? "";
+      const format = url.searchParams.get("format") === "html" ? "html" : "json";
+      const found = runId ? this.timelines.getTimeline(runId) : null;
+      if (!found) {
+        res.writeHead(404, { "Content-Type": "application/json; charset=utf-8" });
+        res.end(JSON.stringify({ error: "Run timeline not found." }));
+        return;
+      }
+      if (format === "html") {
+        res.writeHead(200, {
+          "Content-Type": "text/html; charset=utf-8",
+          "Content-Disposition": `attachment; filename="agent-pair-${found.runId}.html"`,
+        });
+        res.end(exportRunHtml(found));
+        return;
+      }
+      res.writeHead(200, {
+        "Content-Type": "application/json; charset=utf-8",
+        "Content-Disposition": `attachment; filename="agent-pair-${found.runId}.json"`,
+      });
+      res.end(exportRunJson(found));
       return;
     }
     if (route === "/events") {
@@ -1063,6 +1123,12 @@ function dashboardHtml(token: string, nonce: string): string {
     .metrics-table th, .metrics-table td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--border); white-space: nowrap; }
     .metrics-table th { color: var(--muted); font-size: 0.74rem; text-transform: uppercase; letter-spacing: 0.04em; }
     .metrics-muted { color: var(--muted); font-style: italic; }
+    .replay-panel { margin-bottom: 18px; }
+    .replay-controls { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin: 10px 0; }
+    .replay-controls input[type="range"] { flex: 1; min-width: 180px; accent-color: var(--accent); }
+    .replay-events { max-height: 200px; overflow-y: auto; display: grid; gap: 6px; margin-top: 10px; }
+    .replay-event { padding: 7px 10px; border-radius: 10px; background: var(--surface-soft); border: 1.5px solid var(--border); cursor: pointer; font-size: 0.8rem; text-align: left; color: var(--ink); font-family: inherit; }
+    .replay-event.current { border-color: var(--accent); background: var(--tag-bg); }
   </style>
 </head>
 <body>
@@ -1088,6 +1154,7 @@ function dashboardHtml(token: string, nonce: string): string {
         <span class="pill" id="connPill"><span class="live-dot" id="connDot"></span><span id="connText">Connecting...</span></span>
         <select class="run-select" id="runSelect" style="display:none" aria-label="Active team run"></select>
         <button class="btn" id="teamMapBtn" type="button" aria-pressed="false">Team Map</button>
+        <button class="btn" id="replayBtn" type="button" aria-pressed="false">Replay</button>
         <button class="btn" id="copyWorkerBtn" type="button" title="Copy the worker join prompt">Copy Worker Prompt</button>
         <button class="btn" id="soundBtn" type="button" title="Toggle soft chime sounds">Sound: Off</button>
         <button class="btn" id="themeBtn" type="button" title="Switch cozy dark or cream paper theme">Cream Paper</button>
@@ -1134,6 +1201,7 @@ function dashboardHtml(token: string, nonce: string): string {
         <button class="btn" id="cancelFolder" type="button">Cancel</button>
       </div>
     </dialog>
+    <section id="replayPanel" class="panel replay-panel" aria-label="Run replay" hidden></section>
     <section id="teamMap" class="panel team-map" aria-label="Team map" hidden></section>
     <main id="app"></main>
   </div>
@@ -1151,13 +1219,213 @@ function dashboardHtml(token: string, nonce: string): string {
     let demoMode = false;
     let mapVisible = false;
     let mapSelection;
+    let replayVisible = false;
+    let replayTimelines = [];
+    let replayData = null;
+    let replayStep = -1;
+    let replayTimer = null;
+    let replaySpeed = 650;
     let soundOn = false;
     let audioContext;
     let lastEventKey = "";
 
     const appEl = document.getElementById("app");
+    const replayPanel = document.getElementById("replayPanel");
+    const replayBtn = document.getElementById("replayBtn");
     const teamMap = document.getElementById("teamMap");
     const teamMapBtn = document.getElementById("teamMapBtn");
+
+    function stopReplayPlayback() {
+      if (replayTimer) clearInterval(replayTimer);
+      replayTimer = null;
+    }
+
+    async function loadReplayList(targetRunId) {
+      try {
+        const res = await fetch(BASE + "/api/timelines");
+        if (!res.ok) return;
+        const data = await res.json();
+        replayTimelines = data.runs || [];
+        const pick = targetRunId || replayData?.runId || selectedRunId || replayTimelines[0]?.runId;
+        if (pick) await loadReplayRun(pick);
+        else render();
+      } catch {}
+    }
+
+    async function loadReplayRun(runId) {
+      stopReplayPlayback();
+      try {
+        const res = await fetch(BASE + "/api/timeline?runId=" + encodeURIComponent(runId));
+        if (!res.ok) { replayData = null; replayStep = -1; render(); return; }
+        replayData = await res.json();
+        replayData.events = [...(replayData.events || [])].sort((a, b) => (a.id - b.id) || (a.timestamp - b.timestamp));
+        replayStep = replayData.events.length ? replayData.events.length - 1 : -1;
+        render();
+      } catch {}
+    }
+
+    function buildReplayRun(tl, index) {
+      const events = tl.events || [];
+      const clamped = events.length ? Math.max(-1, Math.min(index, events.length - 1)) : -1;
+      const slice = clamped >= 0 ? events.slice(0, clamped + 1) : [];
+      const taskMap = new Map((tl.tasks || []).map((t) => [t.id, { ...t, state: "pending", note: undefined, evidence: undefined }]));
+      const connected = new Set();
+      const claimed = new Set();
+      const messages = [];
+      const byId = new Map();
+      const activeMembers = new Set();
+      for (const ev of slice) {
+        if (ev.type === "member.joined" && ev.member) { connected.add(ev.member); claimed.add(ev.member); }
+        if (ev.type === "member.disconnected" && ev.member) connected.delete(ev.member);
+        if (ev.taskId && taskMap.has(ev.taskId)) {
+          const t = taskMap.get(ev.taskId);
+          if (ev.type === "task.started") { t.state = ev.data?.state || "active"; t.evidence = undefined; }
+          if (ev.type === "task.blocked" || ev.type === "task.stalled") { t.state = "blocked"; t.evidence = undefined; }
+          if (ev.type === "task.handoff") { t.state = ev.data?.state || "ready"; if (Array.isArray(ev.data?.checks)) t.evidence = ev.data.checks; }
+          if (ev.type === "task.revised") { t.state = ev.data?.state || "pending"; t.evidence = undefined; }
+          if (ev.type === "task.accepted") t.state = ev.data?.state || "accepted";
+          if (typeof ev.data?.note === "string") t.note = ev.data.note;
+        }
+        if (ev.type === "message.sent" && ev.data?.message) {
+          const msg = { ...ev.data.message, acknowledged: false };
+          messages.push(msg);
+          byId.set(msg.id, msg);
+        }
+        if (ev.type === "message.acked" && typeof ev.data?.messageId === "number" && byId.has(ev.data.messageId)) {
+          byId.get(ev.data.messageId).acknowledged = true;
+        }
+      }
+      const cur = clamped >= 0 ? events[clamped] : null;
+      if (cur?.member) activeMembers.add(cur.member);
+      const tasks = [...taskMap.values()];
+      const members = (tl.members || []).map((m) => {
+        const owned = tasks.filter((t) => t.owner === m.member);
+        const active = owned.find((t) => t.state === "active");
+        const blocked = owned.find((t) => t.state === "blocked");
+        const ready = owned.find((t) => t.state === "ready");
+        const allAccepted = owned.length > 0 && owned.every((t) => t.state === "accepted");
+        const status = !claimed.has(m.member) ? "waiting"
+          : allAccepted ? "done"
+          : !connected.has(m.member) ? "disconnected"
+          : active ? "working"
+          : blocked ? "blocked"
+          : ready ? "review" : "idle";
+        const focus = active || blocked || ready || owned.find((t) => t.state === "pending");
+        return {
+          ...m,
+          connected: connected.has(m.member),
+          claimed: claimed.has(m.member),
+          hasSessionId: Boolean(tl.tag),
+          status,
+          currentTaskId: focus?.id,
+          currentTaskTitle: focus?.title,
+          unread: messages.filter((msg) => msg.to === m.member && !msg.acknowledged).length,
+        };
+      });
+      return {
+        pulse: activeMembers.size ? { runId: tl.runId, members: [...activeMembers] } : undefined,
+        run: {
+          id: tl.runId,
+          mode: tl.mode || "team",
+          workspace: tl.workspace,
+          workspaceName: tl.workspaceName + " (Replay)",
+          tag: tl.tag,
+          missingSessionIds: [],
+          waitingFor: members.filter((m) => !m.claimed).length,
+          createdAt: tl.createdAt,
+          expiresAt: tl.closedAt || tl.updatedAt,
+          members,
+          tasks,
+          messages,
+          events: slice,
+          metrics: tl.metrics,
+        },
+      };
+    }
+
+    function renderReplayPanel() {
+      replayPanel.hidden = !replayVisible;
+      replayBtn.setAttribute("aria-pressed", String(replayVisible));
+      replayBtn.classList.toggle("active-toggle", replayVisible);
+      if (!replayVisible) return;
+      const options = replayTimelines.map((item) =>
+        '<option value="' + esc(item.runId) + '"' + (item.runId === replayData?.runId ? " selected" : "") + ">" +
+        esc(item.workspaceName + " · " + item.runId.slice(0, 8) + " (" + item.eventCount + " events)") + "</option>"
+      ).join("");
+      const events = replayData?.events || [];
+      const cur = replayStep >= 0 ? events[replayStep] : null;
+      const exportLinks = replayData
+        ? '<a class="btn" style="text-decoration:none" href="' + esc(BASE + "/api/export?runId=" + encodeURIComponent(replayData.runId) + "&format=json") + '">Export JSON</a>' +
+          '<a class="btn" style="text-decoration:none" href="' + esc(BASE + "/api/export?runId=" + encodeURIComponent(replayData.runId) + "&format=html") + '">Export Static HTML</a>'
+        : "";
+      replayPanel.innerHTML =
+        '<div class="section-head" style="margin-top:0"><h2>⏪ Run Replay &amp; Export</h2>' +
+          '<div class="controls">' +
+            (options ? '<select class="run-select" id="replayRunSelect" aria-label="Recorded run">' + options + "</select>" : '<span class="metrics-muted">No recorded runs yet</span>') +
+            exportLinks +
+          "</div></div>" +
+        (replayData
+          ? '<div class="replay-controls">' +
+              '<button class="btn" id="replayPlayBtn" type="button">' + (replayTimer ? "Pause" : "Play") + "</button>" +
+              '<button class="btn" id="replayPrevBtn" type="button">Prev</button>' +
+              '<button class="btn" id="replayNextBtn" type="button">Next</button>' +
+              '<input id="replayScrub" type="range" min="' + (events.length ? 0 : -1) + '" max="' + Math.max(-1, events.length - 1) + '" value="' + replayStep + '" aria-label="Replay scrub" />' +
+              '<select class="run-select" id="replaySpeedSel" aria-label="Replay speed">' +
+                '<option value="1200"' + (replaySpeed === 1200 ? " selected" : "") + '>0.5x</option>' +
+                '<option value="650"' + (replaySpeed === 650 ? " selected" : "") + '>1x</option>' +
+                '<option value="280"' + (replaySpeed === 280 ? " selected" : "") + '>2x</option>' +
+              "</select>" +
+              '<span class="mono-pill">' + (events.length ? "Step " + (replayStep + 1) + " / " + events.length : "0 events") + "</span>" +
+            "</div>" +
+            '<div style="font-size:0.82rem;color:var(--muted)">' +
+              (cur ? esc("#" + cur.id + " · " + new Date(cur.timestamp).toLocaleTimeString() + " · " + cur.type + (cur.member ? " · " + cur.member : "") + (cur.taskId ? " · " + cur.taskId : "")) : "Initial state") +
+            "</div>" +
+            '<div class="replay-events">' +
+              events.map((ev, idx) =>
+                '<button type="button" class="replay-event' + (idx === replayStep ? " current" : "") + '" data-replay-idx="' + idx + '">' +
+                  '<span class="mono-pill">#' + ev.id + "</span> <strong>" + esc(ev.type) + "</strong>" +
+                  (ev.member ? " · " + esc(ev.member) : "") + (ev.taskId ? ' · <span class="mono-pill">' + esc(ev.taskId) + "</span>" : "") +
+                "</button>"
+              ).join("") +
+            "</div>"
+          : "");
+      const sel = document.getElementById("replayRunSelect");
+      if (sel) sel.addEventListener("change", () => void loadReplayRun(sel.value));
+      const play = document.getElementById("replayPlayBtn");
+      if (play) play.addEventListener("click", () => {
+        if (replayTimer) { stopReplayPlayback(); render(); return; }
+        if (!events.length) return;
+        if (replayStep >= events.length - 1) replayStep = 0;
+        replayTimer = setInterval(() => {
+          if (!replayData || replayStep >= replayData.events.length - 1) { stopReplayPlayback(); render(); return; }
+          replayStep += 1;
+          render();
+        }, replaySpeed);
+        render();
+      });
+      const prev = document.getElementById("replayPrevBtn");
+      if (prev) prev.addEventListener("click", () => { stopReplayPlayback(); if (replayStep > 0) { replayStep -= 1; render(); } });
+      const next = document.getElementById("replayNextBtn");
+      if (next) next.addEventListener("click", () => { stopReplayPlayback(); if (replayStep < events.length - 1) { replayStep += 1; render(); } });
+      const scrub = document.getElementById("replayScrub");
+      if (scrub) scrub.addEventListener("input", () => { stopReplayPlayback(); replayStep = Number(scrub.value); render(); });
+      const spd = document.getElementById("replaySpeedSel");
+      if (spd) spd.addEventListener("change", () => { replaySpeed = Number(spd.value); });
+      replayPanel.querySelectorAll("[data-replay-idx]").forEach((btn) => {
+        btn.addEventListener("click", () => { stopReplayPlayback(); replayStep = Number(btn.dataset.replayIdx); render(); });
+      });
+    }
+
+    replayBtn.addEventListener("click", () => {
+      replayVisible = !replayVisible;
+      if (replayVisible) {
+        mapVisible = true;
+        void loadReplayList();
+      } else {
+        stopReplayPlayback();
+      }
+      render();
+    });
     teamMapBtn.addEventListener("click", () => {
       mapVisible = !mapVisible;
       if (mapVisible && !snapshot.runs.length) demoMode = true;
@@ -1725,9 +1993,16 @@ function dashboardHtml(token: string, nonce: string): string {
     }
 
     function render(pulse) {
+      renderReplayPanel();
       const data = activeData();
-      const run = data.runs.find((r) => r.id === selectedRunId) || data.runs[0];
-      renderMap(run, pulse);
+      let run = data.runs.find((r) => r.id === selectedRunId) || data.runs[0];
+      let effectivePulse = pulse;
+      if (replayVisible && replayData) {
+        const replayed = buildReplayRun(replayData, replayStep);
+        run = replayed.run;
+        effectivePulse = replayed.pulse;
+      }
+      renderMap(run, effectivePulse);
       if (data.runs.length > 1) {
         runSelect.style.display = "inline-flex";
         runSelect.innerHTML = data.runs.map((r) =>
@@ -2006,6 +2281,12 @@ function dashboardHtml(token: string, nonce: string): string {
       });
     }, 5000);
 
+    const initialReplay = new URLSearchParams(window.location.search).get("replay");
+    if (initialReplay) {
+      replayVisible = true;
+      mapVisible = true;
+      void loadReplayList(initialReplay);
+    }
     render();
     connectEvents();
   </script>

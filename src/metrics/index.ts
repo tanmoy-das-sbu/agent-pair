@@ -1,4 +1,5 @@
 export { aggregateRunMetrics, type AggregateMetricsInput } from "./aggregator.js";
+export { exportRunHtml, exportRunJson, writeRunExport } from "./export.js";
 export {
   attachMetricsTracker,
   listSavedMetrics,
@@ -8,6 +9,21 @@ export {
   MetricsTracker,
   saveRunMetrics,
 } from "./store.js";
+export {
+  buildRunTimeline,
+  listSavedTimelines,
+  loadRunTimeline,
+  replayRunAt,
+  saveRunTimeline,
+  sortTimelineEvents,
+  timelineFilePath,
+  TimelineRecorder,
+  timelinesDirectory,
+  type ReplayFrame,
+  type RunTimeline,
+  type TimelineMemberSeed,
+  type TimelineTaskSeed,
+} from "./timeline.js";
 export {
   usageReportSchema,
   type AgentMetrics,
