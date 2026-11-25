@@ -1,12 +1,12 @@
 # Agent Pair
 
-[![CI](https://github.com/tanmoy-das-sbu/agent-pair/actions/workflows/ci.yml/badge.svg)](https://github.com/tanmoy-das-sbu/agent-pair/actions/workflows/ci.yml) [![npm version](https://img.shields.io/npm/v/%40tnmy57%2Fagent-pair)](https://www.npmjs.com/package/@tnmy57/agent-pair) [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
+[![CI](https://github.com/tnmy57/agent-pair/actions/workflows/ci.yml/badge.svg)](https://github.com/tnmy57/agent-pair/actions/workflows/ci.yml) [![npm version](https://img.shields.io/npm/v/%40tnmy57%2Fagent-pair)](https://www.npmjs.com/package/@tnmy57/agent-pair) [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
 Coordinate multiple Codex, Google Antigravity, and Claude Code sessions in one workspace with explicit task ownership, dependency gating, directed messaging, and a live local dashboard.
 
 ![Agent Pair dashboard demo showing the team map, task states, and dependencies](docs/media/team-map-demo.gif)
 
-The recording shows the dashboard's built-in demo data, not a live run. [GitHub repository](https://github.com/tanmoy-das-sbu/agent-pair) · [Architecture and case study](docs/CASE_STUDY.md)
+The recording shows the dashboard's built-in demo data, not a live run. [GitHub repository](https://github.com/tnmy57/agent-pair) · [Architecture and case study](docs/CASE_STUDY.md)
 
 ## Quickstart
 

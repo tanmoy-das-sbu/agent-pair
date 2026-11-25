@@ -3,9 +3,9 @@
   "version": "0.4.0",
   "description": "Coordinate Codex, Antigravity, and Claude Code sessions in one workspace",
   "license": "MIT",
-  "repository": { "type": "git", "url": "git+https://github.com/tanmoy-das-sbu/agent-pair.git" },
-  "bugs": { "url": "https://github.com/tanmoy-das-sbu/agent-pair/issues" },
-  "homepage": "https://github.com/tanmoy-das-sbu/agent-pair#readme",
+  "repository": { "type": "git", "url": "git+https://github.com/tnmy57/agent-pair.git" },
+  "bugs": { "url": "https://github.com/tnmy57/agent-pair/issues" },
+  "homepage": "https://github.com/tnmy57/agent-pair#readme",
   "keywords": ["mcp", "multi-agent", "codex", "claude-code", "antigravity", "ai-agents", "orchestration", "developer-tools"],
   "type": "module",
   "bin": {
