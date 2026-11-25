@@ -96,4 +96,52 @@ test("dashboard serves run metrics, persists metrics JSON, and accepts optional 
   const fetched = await metricsApi.json();
   assert.equal(fetched.agents["worker-b"].usage.costUsd, 0.021);
   assert.equal(fetched.agents.orchestrator.usage.costUsd, null);
+
+  clock += 2_000;
+  await relay.execute({ action: "disconnect", role: "codex", handle: started.handle }, signal);
+  const afterClose = loadRunMetrics(started.runId, dir);
+  assert.equal(afterClose?.closedAt, clock);
+  assert.equal(afterClose?.totals.usage.costUsd, 0.021);
+});
+
+test("DashboardServer persists per-run metrics even when HTTP server is never started and retains them on close", async (t) => {
+  const dir = tempDir(t);
+  let clock = 20_000;
+  const relay = new Relay(dir, () => clock);
+  const dashboard = new DashboardServer(relay, dir);
+  t.after(() => dashboard.close());
+  assert.equal(dashboard.isStarted, false);
+
+  const signal = new AbortController().signal;
+  const started = await relay.execute({
+    action: "teamStart",
+    role: "codex",
+    workspace: dir,
+    enforce: "off",
+    workerCount: 1,
+    allowedProfiles: ["antigravity"],
+    assignments: [
+      { id: "t1", owner: "orchestrator", profile: "codex", title: "T1", paths: ["src/t1"], checks: ["ok"] },
+      { id: "t2", owner: "worker-b", profile: "antigravity", title: "T2", paths: ["src/t2"], checks: ["ok"] },
+    ],
+  }, signal);
+
+  clock += 1_500;
+  await relay.execute({ action: "teamUpdate", role: "codex", handle: started.handle, taskId: "t1", transition: "start" }, signal);
+  clock += 2_500;
+  await relay.execute({ action: "teamUpdate", role: "codex", handle: started.handle, taskId: "t1", transition: "handoff", note: "ready", checks: ["ok"] }, signal);
+  clock += 500;
+  await relay.execute({ action: "teamUpdate", role: "codex", handle: started.handle, taskId: "t1", transition: "accept" }, signal);
+
+  const persistedActive = loadRunMetrics(started.runId, dir);
+  assert.equal(persistedActive?.totals.acceptedTasks, 1);
+  assert.equal(persistedActive?.tasks.t1.wallTimeMs, 3_000);
+
+  clock += 500;
+  await relay.execute({ action: "disconnect", role: "codex", handle: started.handle }, signal);
+  assert.equal(dashboard.isStarted, false);
+
+  const persistedClosed = loadRunMetrics(started.runId, dir);
+  assert.equal(persistedClosed?.closedAt, 25_000);
+  assert.equal(persistedClosed?.totals.acceptedTasks, 1);
 });

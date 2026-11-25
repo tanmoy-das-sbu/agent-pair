@@ -70,6 +70,7 @@ export type RunMetrics = {
   mode?: "team" | "pair";
   tag?: string;
   startedAt: number | null;
+  closedAt?: number;
   updatedAt: number;
   durationMs: number | null;
   eventCount: number;

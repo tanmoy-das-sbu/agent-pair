@@ -5,11 +5,13 @@ import { dirname, join, resolve } from "node:path";
 import test from "node:test";
 import {
   aggregateRunMetrics,
+  attachMetricsTracker,
   listSavedMetrics,
   loadRunMetrics,
   MetricsTracker,
   saveRunMetrics,
 } from "../../dist/metrics/index.js";
+import { Relay } from "../../dist/relay.js";
 
 function tempDir(t) {
   const parent = realpathSync(tmpdir());
@@ -173,4 +175,49 @@ test("MetricsTracker syncs snapshots and attaches usage reports", (t) => {
   assert.equal(updated?.totals.usage.costUsd, 0.03);
   const onDisk = loadRunMetrics("run-track-1", dir);
   assert.equal(onDisk?.totals.usage.costUsd, 0.03);
+});
+
+test("attachMetricsTracker persists live relay events without dashboard clients and retains final metrics on close", async (t) => {
+  const dir = tempDir(t);
+  let clock = 5_000;
+  const relay = new Relay(dir, () => clock);
+  const { tracker, detach } = attachMetricsTracker(relay, dir);
+  t.after(() => detach());
+
+  const signal = new AbortController().signal;
+  const run = await relay.execute({
+    action: "teamStart",
+    role: "codex",
+    workspace: dir,
+    enforce: "off",
+    workerCount: 1,
+    allowedProfiles: ["antigravity"],
+    assignments: [
+      { id: "a", owner: "orchestrator", profile: "codex", title: "A", paths: ["src/a"], checks: ["ok"] },
+      { id: "b", owner: "worker-b", profile: "antigravity", title: "B", paths: ["src/b"], checks: ["ok"] },
+    ],
+  }, signal);
+
+  clock += 1_000;
+  const worker = await relay.execute({ action: "teamJoin", role: "antigravity", workspace: dir }, signal);
+  clock += 500;
+  await relay.execute({ action: "teamUpdate", role: "antigravity", handle: worker.handle, taskId: "b", transition: "start" }, signal);
+  clock += 2_000;
+  await relay.execute({ action: "teamUpdate", role: "antigravity", handle: worker.handle, taskId: "b", transition: "handoff", note: "done", checks: ["ok"] }, signal);
+  clock += 500;
+  await relay.execute({ action: "teamUpdate", role: "codex", handle: run.handle, taskId: "b", transition: "accept" }, signal);
+
+  const beforeClose = loadRunMetrics(run.runId, dir);
+  assert.equal(beforeClose?.totals.acceptedTasks, 1);
+  assert.equal(beforeClose?.closedAt, undefined);
+
+  clock += 1_000;
+  await relay.execute({ action: "disconnect", role: "codex", handle: run.handle }, signal);
+
+  const afterClose = loadRunMetrics(run.runId, dir);
+  assert.equal(afterClose?.totals.acceptedTasks, 1);
+  assert.equal(afterClose?.tasks.b.wallTimeMs, 2_500);
+  assert.equal(afterClose?.closedAt, 10_000);
+  assert.equal(afterClose?.durationMs, 5_000);
+  assert.equal(tracker.getMetrics(run.runId)?.closedAt, 10_000);
 });

@@ -1,5 +1,6 @@
 export { aggregateRunMetrics, type AggregateMetricsInput } from "./aggregator.js";
 export {
+  attachMetricsTracker,
   listSavedMetrics,
   loadRunMetrics,
   metricsDirectory,

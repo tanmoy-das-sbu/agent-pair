@@ -52,6 +52,7 @@ export class DashboardServer {
 
   constructor(private readonly relay: Relay, dataDir?: string) {
     this.metrics = new MetricsTracker(dataDir);
+    this.metrics.attach(relay);
   }
 
   get hasClients(): boolean {
@@ -83,7 +84,6 @@ export class DashboardServer {
     const { port } = server.address() as AddressInfo;
     this.addressUrl = `http://127.0.0.1:${port}/d/${this.token}/`;
     this.unsubscribe = this.relay.subscribe(() => {
-      this.metrics.syncSnapshot(this.relay.snapshot());
       this.scheduleBroadcast();
     });
     this.heartbeat = setInterval(() => {
@@ -96,6 +96,7 @@ export class DashboardServer {
   }
 
   close(): void {
+    this.metrics.detach();
     this.unsubscribe?.();
     this.unsubscribe = undefined;
     if (this.heartbeat) clearInterval(this.heartbeat);

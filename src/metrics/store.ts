@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { mkdirSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import type { DashboardRun, DashboardSnapshot } from "../relay.js";
+import type { DashboardRun, DashboardSnapshot, Relay } from "../relay.js";
 import { dataDirectory } from "../workspace.js";
 import { aggregateRunMetrics } from "./aggregator.js";
 import { usageReportSchema, type RunMetrics, type UsageReport } from "./types.js";
@@ -62,10 +62,29 @@ export function listSavedMetrics(baseDir?: string): string[] {
 export class MetricsTracker {
   private readonly usageByRun = new Map<string, UsageReport[]>();
   private readonly latestRunMeta = new Map<string, DashboardRun>();
+  private readonly activeRunIds = new Set<string>();
   private readonly latestMetrics = new Map<string, RunMetrics>();
   private readonly persistedKeys = new Map<string, string>();
+  private detachRelay?: () => void;
 
   constructor(private readonly baseDir?: string, private readonly persist = true) {}
+
+  attach(relay: Relay): () => void {
+    this.detach();
+    this.syncSnapshot(relay.snapshot());
+    const unsubscribe = relay.subscribe(() => {
+      this.syncSnapshot(relay.snapshot());
+    });
+    this.detachRelay = () => {
+      unsubscribe();
+      this.detachRelay = undefined;
+    };
+    return this.detachRelay;
+  }
+
+  detach(): void {
+    this.detachRelay?.();
+  }
 
   recordUsage(input: unknown): UsageReport {
     const parsed = usageReportSchema.parse(input);
@@ -86,9 +105,20 @@ export class MetricsTracker {
 
   syncSnapshot(snapshot: DashboardSnapshot): Record<string, RunMetrics> {
     const result: Record<string, RunMetrics> = {};
+    const seen = new Set<string>();
     for (const run of snapshot.runs) {
+      seen.add(run.id);
+      this.activeRunIds.add(run.id);
       this.latestRunMeta.set(run.id, run);
       result[run.id] = this.computeAndPersist(run, snapshot.now);
+    }
+    for (const runId of [...this.activeRunIds]) {
+      if (seen.has(runId)) continue;
+      this.activeRunIds.delete(runId);
+      const lastRun = this.latestRunMeta.get(runId);
+      if (lastRun) {
+        this.computeAndPersist(lastRun, snapshot.now, snapshot.now);
+      }
     }
     return result;
   }
@@ -114,9 +144,9 @@ export class MetricsTracker {
     return [...byId.values()].sort((left, right) => right.updatedAt - left.updatedAt);
   }
 
-  private computeAndPersist(run: DashboardRun, now?: number): RunMetrics {
+  private computeAndPersist(run: DashboardRun, now?: number, closedAt?: number): RunMetrics {
     const usageReports = this.usageByRun.get(run.id) ?? [];
-    const metrics = aggregateRunMetrics({
+    const base = aggregateRunMetrics({
       runId: run.id,
       events: run.events ?? [],
       usageReports,
@@ -128,9 +158,10 @@ export class MetricsTracker {
       createdAt: run.createdAt,
       now,
     });
+    const metrics: RunMetrics = closedAt !== undefined ? { ...base, closedAt } : base;
     this.latestMetrics.set(run.id, metrics);
     if (this.persist) {
-      const fingerprint = `${metrics.eventCount}:${usageReports.length}:${run.tasks.map((t) => t.state).join(",")}:${run.tag ?? ""}`;
+      const fingerprint = `${metrics.eventCount}:${usageReports.length}:${run.tasks.map((t) => t.state).join(",")}:${run.tag ?? ""}:${closedAt ?? ""}`;
       if (this.persistedKeys.get(run.id) !== fingerprint) {
         try {
           saveRunMetrics(metrics, this.baseDir);
@@ -142,4 +173,10 @@ export class MetricsTracker {
     }
     return metrics;
   }
+}
+
+export function attachMetricsTracker(relay: Relay, baseDir?: string): { tracker: MetricsTracker; detach: () => void } {
+  const tracker = new MetricsTracker(baseDir);
+  const detach = tracker.attach(relay);
+  return { tracker, detach };
 }
