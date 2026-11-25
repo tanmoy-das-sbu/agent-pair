@@ -5,7 +5,8 @@ import type { AddressInfo } from "node:net";
 import { readdir, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, resolve } from "node:path";
-import type { Relay } from "./relay.js";
+import type { DashboardSnapshot, Relay } from "./relay.js";
+import { MetricsTracker, usageReportSchema, type RunMetrics } from "./metrics/index.js";
 import { teamSetupSchema } from "./types.js";
 
 const clientNames = { codex: "Codex", antigravity: "Antigravity", claude: "Claude Code" };
@@ -47,10 +48,18 @@ export class DashboardServer {
   private heartbeat?: NodeJS.Timeout;
   private addressUrl?: string;
 
-  constructor(private readonly relay: Relay) {}
+  private readonly metrics: MetricsTracker;
+
+  constructor(private readonly relay: Relay, dataDir?: string) {
+    this.metrics = new MetricsTracker(dataDir);
+  }
 
   get hasClients(): boolean {
     return this.clients.size > 0;
+  }
+
+  get isStarted(): boolean {
+    return this.addressUrl !== undefined;
   }
 
   async ensureStarted(): Promise<string> {
@@ -73,7 +82,10 @@ export class DashboardServer {
     this.server = server;
     const { port } = server.address() as AddressInfo;
     this.addressUrl = `http://127.0.0.1:${port}/d/${this.token}/`;
-    this.unsubscribe = this.relay.subscribe(() => this.scheduleBroadcast());
+    this.unsubscribe = this.relay.subscribe(() => {
+      this.metrics.syncSnapshot(this.relay.snapshot());
+      this.scheduleBroadcast();
+    });
     this.heartbeat = setInterval(() => {
       for (const client of this.clients) {
         if (!client.writableEnded && !client.writableNeedDrain) client.write(": ping\n\n");
@@ -100,8 +112,17 @@ export class DashboardServer {
     this.addressUrl = undefined;
   }
 
+  private enrichedSnapshot(): DashboardSnapshot & { runs: Array<DashboardSnapshot["runs"][number] & { metrics: RunMetrics }> } {
+    const snap = this.relay.snapshot();
+    const byRun = this.metrics.syncSnapshot(snap);
+    return {
+      ...snap,
+      runs: snap.runs.map((run) => ({ ...run, metrics: byRun[run.id] })),
+    };
+  }
+
   private snapshotEvent(): string {
-    return `event: snapshot\ndata: ${JSON.stringify(this.relay.snapshot())}\n\n`;
+    return `event: snapshot\ndata: ${JSON.stringify(this.enrichedSnapshot())}\n\n`;
   }
 
   private scheduleBroadcast(): void {
@@ -141,6 +162,10 @@ export class DashboardServer {
       void this.handleSetup(req, res, url, pickFolder);
       return;
     }
+    if (route === "/api/metrics/usage" && req.method === "POST") {
+      void this.handleUsageReport(req, res);
+      return;
+    }
     if (req.method !== "GET") {
       res.writeHead(405, { "Content-Type": "text/plain; charset=utf-8" });
       res.end("Method Not Allowed");
@@ -157,7 +182,20 @@ export class DashboardServer {
     }
     if (route === "/api/state") {
       res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
-      res.end(JSON.stringify(this.relay.snapshot()));
+      res.end(JSON.stringify(this.enrichedSnapshot()));
+      return;
+    }
+    if (route === "/api/metrics") {
+      this.metrics.syncSnapshot(this.relay.snapshot());
+      const runId = url.searchParams.get("runId");
+      if (runId) {
+        const found = this.metrics.getMetrics(runId);
+        res.writeHead(found ? 200 : 404, { "Content-Type": "application/json; charset=utf-8" });
+        res.end(JSON.stringify(found ?? { error: "Run metrics not found." }));
+        return;
+      }
+      res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
+      res.end(JSON.stringify({ runs: this.metrics.listMetrics() }));
       return;
     }
     if (route === "/events") {
@@ -247,6 +285,47 @@ export class DashboardServer {
       respond(201, this.relay.saveTeamSetup(parsed.data));
     } catch (error) {
       if (!res.destroyed) respond(400, { error: error instanceof Error ? error.message : "Unable to save team setup." });
+    }
+  }
+
+  private async handleUsageReport(req: IncomingMessage, res: ServerResponse): Promise<void> {
+    const respond = (status: number, data: unknown) => {
+      res.writeHead(status, { "Content-Type": "application/json; charset=utf-8" });
+      res.end(JSON.stringify(data));
+    };
+    if (req.headers.origin && req.headers.origin !== new URL(this.addressUrl!).origin) {
+      req.resume();
+      respond(403, { error: "Submit usage reports from the local dashboard or trusted local client." });
+      return;
+    }
+    if (req.headers["content-type"]?.split(";")[0] !== "application/json") {
+      req.resume();
+      respond(415, { error: "Send usage reports as JSON." });
+      return;
+    }
+    try {
+      let size = 0;
+      const chunks: Buffer[] = [];
+      for await (const chunk of req.iterator({ destroyOnReturn: false })) {
+        size += chunk.length;
+        if (size > 32_768) {
+          req.resume();
+          respond(413, { error: "Usage report payload is too large." });
+          return;
+        }
+        chunks.push(chunk);
+      }
+      const parsed = usageReportSchema.safeParse(JSON.parse(Buffer.concat(chunks).toString("utf8")));
+      if (!parsed.success) {
+        respond(400, { error: parsed.error.issues[0].message });
+        return;
+      }
+      this.metrics.syncSnapshot(this.relay.snapshot());
+      const report = this.metrics.recordUsage(parsed.data);
+      this.scheduleBroadcast();
+      respond(201, { report, metrics: this.metrics.getMetrics(report.runId) });
+    } catch (error) {
+      if (!res.destroyed) respond(400, { error: error instanceof Error ? error.message : "Unable to record usage report." });
     }
   }
 }
@@ -972,6 +1051,17 @@ function dashboardHtml(token: string, nonce: string): string {
     .map-dependency { width: 100%; text-align: left; overflow-wrap: anywhere; }
     .map-branch.map-pulse::before, .map-stem.map-pulse { animation: map-signal 0.8s ease-out; }
     @keyframes map-signal { from { box-shadow: 0 0 0 4px var(--accent); } to { box-shadow: 0 0 0 0 transparent; } }
+    .metrics-panel { margin-top: 18px; }
+    .metrics-kpis { display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 10px; margin-bottom: 16px; }
+    .kpi-card { background: var(--surface-soft); border: 2px solid var(--border); border-radius: 16px; padding: 10px 12px; display: grid; gap: 2px; }
+    .kpi-label { font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.04em; color: var(--muted); font-weight: 800; }
+    .kpi-value { font-size: 1.05rem; font-weight: 900; }
+    .metrics-grid { display: grid; grid-template-columns: 1fr; gap: 16px; }
+    .metrics-table-wrap { overflow-x: auto; }
+    .metrics-table { width: 100%; border-collapse: collapse; font-size: 0.82rem; }
+    .metrics-table th, .metrics-table td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--border); white-space: nowrap; }
+    .metrics-table th { color: var(--muted); font-size: 0.74rem; text-transform: uppercase; letter-spacing: 0.04em; }
+    .metrics-muted { color: var(--muted); font-style: italic; }
   </style>
 </head>
 <body>
@@ -1295,6 +1385,96 @@ function dashboardHtml(token: string, nonce: string): string {
       return Math.floor(mins / 60) + "h ago";
     }
 
+    function fmtDuration(ms) {
+      if (ms === null || ms === undefined || Number.isNaN(ms)) return "—";
+      if (ms < 1000) return ms + "ms";
+      const secs = Math.round(ms / 1000);
+      if (secs < 60) return secs + "s";
+      const mins = Math.floor(secs / 60);
+      const rem = secs % 60;
+      if (mins < 60) return mins + "m " + rem + "s";
+      return Math.floor(mins / 60) + "h " + (mins % 60) + "m";
+    }
+
+    function fmtTokens(usage) {
+      if (!usage || usage.totalTokens === null || usage.totalTokens === undefined) return '<span class="metrics-muted">Not reported</span>';
+      return Number(usage.totalTokens).toLocaleString();
+    }
+
+    function fmtCost(usage) {
+      if (!usage || usage.costUsd === null || usage.costUsd === undefined) return '<span class="metrics-muted">Not reported</span>';
+      return "$" + Number(usage.costUsd).toFixed(4);
+    }
+
+    function renderMetricsPanel(run) {
+      const m = run.metrics;
+      if (!m) return "";
+      const totals = m.totals || {};
+      const agents = Object.values(m.agents || {});
+      const tasks = Object.values(m.tasks || {});
+      const kpis = [
+        ["Run Duration", fmtDuration(m.durationMs)],
+        ["Tasks Accepted", (totals.acceptedTasks ?? 0) + " / " + (totals.tasks ?? 0)],
+        ["Messages", String(totals.messagesSent ?? 0)],
+        ["Handoffs", String(totals.handoffs ?? 0)],
+        ["Revisions", String(totals.revisions ?? 0)],
+        ["Violations", String(totals.ownershipViolations ?? 0)],
+        ["Tokens", fmtTokens(totals.usage)],
+        ["Cost", fmtCost(totals.usage)],
+      ].map(([label, value]) =>
+        '<div class="kpi-card"><span class="kpi-label">' + esc(label) + '</span><span class="kpi-value">' + value + "</span></div>"
+      ).join("");
+
+      const agentRows = agents.length
+        ? agents.map((a) =>
+            "<tr>" +
+              "<td><strong>" + esc(a.member) + "</strong></td>" +
+              "<td>" + (a.profile ? '<span class="client-chip client-' + esc(a.profile) + '">' + esc(a.profile) + "</span>" : "—") + "</td>" +
+              "<td>" + esc(a.tasksAccepted + " / " + a.tasksOwned) + "</td>" +
+              "<td>" + esc(fmtDuration(a.totalActiveTimeMs)) + "</td>" +
+              "<td>" + esc(a.messagesSent + " / " + a.messagesReceived) + "</td>" +
+              "<td>" + esc(a.handoffsSubmitted) + "</td>" +
+              "<td>" + esc(a.revisionsReceived) + "</td>" +
+              "<td>" + esc(a.ownershipViolations) + "</td>" +
+              "<td>" + fmtTokens(a.usage) + "</td>" +
+              "<td>" + fmtCost(a.usage) + "</td>" +
+            "</tr>"
+          ).join("")
+        : '<tr><td colspan="10" class="metrics-muted">No agent activity recorded yet.</td></tr>';
+
+      const taskRows = tasks.length
+        ? tasks.map((t) =>
+            "<tr>" +
+              '<td><span class="mono-pill">' + esc(t.taskId) + "</span></td>" +
+              "<td>" + esc(t.owner || "—") + "</td>" +
+              "<td>" + esc(t.state || "pending") + "</td>" +
+              "<td>" + esc(fmtDuration(t.wallTimeMs)) + "</td>" +
+              "<td>" + esc(t.handoffCount) + "</td>" +
+              "<td>" + esc(t.revisionCount) + "</td>" +
+              "<td>" + esc(t.ownershipViolationCount) + "</td>" +
+              "<td>" + esc(t.messageCount) + "</td>" +
+              "<td>" + fmtTokens(t.usage) + "</td>" +
+              "<td>" + fmtCost(t.usage) + "</td>" +
+            "</tr>"
+          ).join("")
+        : '<tr><td colspan="10" class="metrics-muted">No tasks recorded yet.</td></tr>';
+
+      return (
+        '<section class="panel metrics-panel" id="metricsPanel" aria-label="Metrics and cost">' +
+          '<div class="section-head" style="margin-top:0"><h2>📊 Metrics &amp; Cost</h2><span style="font-size:0.82rem;color:var(--muted)">' + esc(m.eventCount) + " events · Cost shown when reported</span></div>" +
+          '<div class="metrics-kpis">' + kpis + "</div>" +
+          '<div class="metrics-grid">' +
+            '<div class="metrics-table-wrap"><h3 style="margin:0 0 8px;font-size:0.9rem">Per-Agent Breakdown</h3>' +
+              '<table class="metrics-table"><thead><tr><th>Agent</th><th>Profile</th><th>Tasks</th><th>Active Time</th><th>Msgs (S/R)</th><th>Handoffs</th><th>Revisions</th><th>Violations</th><th>Tokens</th><th>Cost</th></tr></thead><tbody>' +
+              agentRows + "</tbody></table></div>" +
+            '<div class="metrics-table-wrap"><h3 style="margin:0 0 8px;font-size:0.9rem">Per-Task Breakdown</h3>' +
+              '<table class="metrics-table"><thead><tr><th>Task</th><th>Owner</th><th>State</th><th>Wall Time</th><th>Handoffs</th><th>Revisions</th><th>Violations</th><th>Msgs</th><th>Tokens</th><th>Cost</th></tr></thead><tbody>' +
+              taskRows + "</tbody></table></div>" +
+          "</div>" +
+        "</section>"
+      );
+    }
+
     function statusInfo(status) {
       const map = {
         working: { label: "Working", cls: "st-working", icon: "⚡" },
@@ -1423,6 +1603,28 @@ function dashboardHtml(token: string, nonce: string): string {
             { id: 2, taskId: "ui", kind: "handoff", from: "frontend", to: "orchestrator", body: "Finished the cartoony UI cards and theme toggle! Ready for review.", createdAt: new Date(now - 25_000).toISOString(), acknowledged: false, checks: ["Build passed", "No console warnings"] },
             { id: 3, taskId: "tests", kind: "blocker", from: "quality", to: "orchestrator", body: "Need the mock auth token helper before running E2E suite.", createdAt: new Date(now - 15_000).toISOString(), acknowledged: false },
           ],
+          metrics: {
+            runId: "demo-run",
+            startedAt: now - 240_000,
+            updatedAt: now,
+            durationMs: 240_000,
+            eventCount: 11,
+            totals: {
+              tasks: 5, acceptedTasks: 1, handoffs: 2, revisions: 0, ownershipViolations: 0, ownershipRejections: 0, messagesSent: 3, messagesAcked: 1,
+              usage: { inputTokens: null, outputTokens: null, totalTokens: null, costUsd: null, reportCount: 0, models: [] },
+            },
+            agents: {
+              orchestrator: { member: "orchestrator", profile: "codex", tasksOwned: 1, tasksAccepted: 1, totalTaskWallTimeMs: 120_000, totalActiveTimeMs: 120_000, messagesSent: 1, messagesReceived: 2, messagesAcked: 0, handoffsSubmitted: 1, revisionsReceived: 0, ownershipViolations: 0, ownershipRejections: 0, usage: { inputTokens: null, outputTokens: null, totalTokens: null, costUsd: null, reportCount: 0, models: [] } },
+              frontend: { member: "frontend", profile: "antigravity", tasksOwned: 1, tasksAccepted: 0, totalTaskWallTimeMs: 65_000, totalActiveTimeMs: 65_000, messagesSent: 1, messagesReceived: 1, messagesAcked: 1, handoffsSubmitted: 1, revisionsReceived: 0, ownershipViolations: 0, ownershipRejections: 0, usage: { inputTokens: null, outputTokens: null, totalTokens: null, costUsd: null, reportCount: 0, models: [] } },
+              quality: { member: "quality", profile: "claude", tasksOwned: 2, tasksAccepted: 0, totalTaskWallTimeMs: 40_000, totalActiveTimeMs: 25_000, messagesSent: 1, messagesReceived: 0, messagesAcked: 0, handoffsSubmitted: 0, revisionsReceived: 0, ownershipViolations: 0, ownershipRejections: 0, usage: { inputTokens: null, outputTokens: null, totalTokens: null, costUsd: null, reportCount: 0, models: [] } },
+            },
+            tasks: {
+              api: { taskId: "api", owner: "orchestrator", state: "accepted", startedAt: now - 210_000, completedAt: now - 90_000, wallTimeMs: 120_000, activeTimeMs: 120_000, handoffCount: 1, revisionCount: 0, ownershipViolationCount: 0, ownershipRejectionCount: 0, blockCount: 0, messageCount: 1, usage: { inputTokens: null, outputTokens: null, totalTokens: null, costUsd: null, reportCount: 0, models: [] } },
+              ui: { taskId: "ui", owner: "frontend", state: "ready", startedAt: now - 90_000, completedAt: null, wallTimeMs: 90_000, activeTimeMs: 65_000, handoffCount: 1, revisionCount: 0, ownershipViolationCount: 0, ownershipRejectionCount: 0, blockCount: 0, messageCount: 1, usage: { inputTokens: null, outputTokens: null, totalTokens: null, costUsd: null, reportCount: 0, models: [] } },
+              fixtures: { taskId: "fixtures", owner: "quality", state: "blocked", startedAt: now - 85_000, completedAt: null, wallTimeMs: 85_000, activeTimeMs: 25_000, handoffCount: 0, revisionCount: 0, ownershipViolationCount: 0, ownershipRejectionCount: 0, blockCount: 1, messageCount: 0, usage: { inputTokens: null, outputTokens: null, totalTokens: null, costUsd: null, reportCount: 0, models: [] } },
+            },
+            usageReports: [],
+          },
         }],
       };
     }
@@ -1714,7 +1916,8 @@ function dashboardHtml(token: string, nonce: string): string {
             '<div class="section-head" style="margin-top:0"><h2>💬 Walkie-Talkie</h2><span style="font-size:0.82rem;color:var(--muted)">' + run.messages.length + " message" + (run.messages.length === 1 ? "" : "s") + "</span></div>" +
             '<div class="msg-list">' + msgHtml + "</div>" +
           "</div>" +
-        "</section>";
+        "</section>" +
+        renderMetricsPanel(run);
 
       appEl.querySelector(".task-list").scrollTop = taskScroll || 0;
       appEl.querySelector(".msg-list").scrollTop = messageScroll || 0;
