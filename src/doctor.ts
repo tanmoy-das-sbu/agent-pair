@@ -1,33 +1,30 @@
-import { execFileSync } from "node:child_process";
 import { mkdtempSync, rmdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
+import { getAdapter, type AdapterLookupOptions } from "./adapters/index.js";
 import { registration, setupPlan } from "./setup.js";
 import { pairRoles, type Role } from "./types.js";
-import { findWindowsExecutable } from "./workspace.js";
 
-export async function doctor(entry: string, profiles: readonly Role[] = pairRoles): Promise<string[]> {
-  const changes = setupPlan(entry, profiles).filter((edit) => edit.content !== edit.original);
+export async function doctor(
+  entry: string,
+  profiles: readonly Role[] = pairRoles,
+  options?: AdapterLookupOptions,
+): Promise<string[]> {
+  const changes = setupPlan(entry, profiles, options).filter((edit) => edit.content !== edit.original);
   if (changes.length) {
     throw new Error(`Setup is incomplete for: ${changes.map((edit) => edit.path).join(", ")}. Run agent-pair setup --dry-run.`);
   }
 
-  const versions = profiles.map((profile) => {
-    const application = profile === "antigravity" ? "agy" : profile;
-    const executable = process.platform === "win32" ? findWindowsExecutable(`${application}.exe`) : application;
-    return execFileSync(executable, ["--version"], {
-      encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], timeout: 5000, windowsHide: true,
-    }).trim();
-  });
+  const versions = profiles.map((profile) => getAdapter(profile, options).doctor());
 
   const workspace = mkdtempSync(join(tmpdir(), "agent-pair-doctor-"));
   const workerProfiles = profiles.length === 1 ? profiles : profiles.slice(1);
   const clients = [profiles[0], ...workerProfiles].map((role) => {
     const reg = registration(entry, role);
     return {
-      client: new Client({ name: `agent-pair-doctor-${role}`, version: "0.3.0" }),
+      client: new Client({ name: `agent-pair-doctor-${role}`, version: "0.3.1" }),
       transport: new StdioClientTransport({
         ...reg,
         env: { ...reg.env, AGENT_PAIR_NO_DASHBOARD: "1" },
