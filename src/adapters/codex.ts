@@ -70,6 +70,7 @@ export const codexAdapter: ClientAdapter = {
   id: "codex",
   displayName: "Codex",
   experimental: false,
+  supportsRelayProfile: true,
   executable: "codex",
 
   setup(context) {

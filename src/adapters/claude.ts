@@ -19,6 +19,7 @@ export const claudeAdapter: ClientAdapter = {
   id: "claude",
   displayName: "Claude Code",
   experimental: false,
+  supportsRelayProfile: true,
   executable: "claude",
 
   setup(context) {

@@ -1,9 +1,13 @@
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import test from "node:test";
+import { fileURLToPath } from "node:url";
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import {
   antigravityAdapter,
   claudeAdapter,
@@ -14,8 +18,12 @@ import {
   registerAdapter,
   registrationFor,
 } from "../../dist/adapters/index.js";
+import { saveSessions } from "../../dist/bookmarks.js";
 import { captureSession } from "../../dist/capture.js";
+import { resumePlan } from "../../dist/resume.js";
 import { applySetup, setupPlan } from "../../dist/setup.js";
+
+const cliEntry = fileURLToPath(new URL("../../dist/cli.js", import.meta.url));
 
 function tempDir(t) {
   const parent = realpathSync(tmpdir());
@@ -130,12 +138,11 @@ const conformanceCases = [
 ];
 
 for (const spec of conformanceCases) {
-  test(`adapter conformance: ${spec.adapter.id}`, (t) => {
+  test(`adapter conformance: ${spec.adapter.id}`, async (t) => {
     const dir = tempDir(t);
     const configHome = join(dir, "config");
     const dataDir = join(dir, "data");
     const workspace = join(dir, "repo");
-    const entry = join(dir, "dist", "cli.js");
     mkdirSync(configHome, { recursive: true });
     mkdirSync(workspace, { recursive: true });
 
@@ -144,23 +151,34 @@ for (const spec of conformanceCases) {
     assert.ok(adapter.displayName.length > 0);
     assert.ok(adapter.executable.length > 0);
     assert.equal(typeof adapter.experimental, "boolean");
+    assert.equal(typeof adapter.supportsRelayProfile, "boolean");
 
-    // 1. Setup preserves foreign entries and is idempotent
+    // 1. Setup preserves foreign entries and is idempotent (or fails closed when relay profile is unsupported)
     spec.seedForeign(configHome);
+    const reg = registrationFor(cliEntry, adapter.id, dataDir);
     const context = {
-      entry,
+      entry: cliEntry,
       configHome,
       skillContent: "# Skill\n",
       dataDir,
       readFile: readOptional,
-      registration: registrationFor(entry, adapter.id, dataDir),
+      registration: reg,
     };
-    const firstPlan = adapter.setup(context);
+
+    const planFn = adapter.supportsRelayProfile
+      ? (ctx) => adapter.setup(ctx)
+      : (ctx) => {
+        assert.throws(() => adapter.setup(ctx), /unusable|roleSchema/i);
+        assert.equal(typeof adapter.previewSetup, "function");
+        return adapter.previewSetup(ctx);
+      };
+
+    const firstPlan = planFn(context);
     assert.ok(firstPlan.length >= 2);
     applySetup(firstPlan);
     spec.assertForeignPreserved(configHome);
 
-    const secondPlan = adapter.setup(context);
+    const secondPlan = planFn(context);
     const secondChanges = secondPlan.filter((edit) => edit.content !== edit.original);
     assert.deepEqual(secondChanges, []);
 
@@ -169,11 +187,38 @@ for (const spec of conformanceCases) {
     mkdirSync(conflictHome, { recursive: true });
     spec.seedUnmanagedConflict(conflictHome);
     assert.throws(
-      () => adapter.setup({ ...context, configHome: conflictHome }),
+      () => planFn({ ...context, configHome: conflictHome }),
       /unmanaged/i,
     );
 
-    // 3. Launch and resume specs across platforms
+    // 3. Actual serve --profile registration verification
+    if (adapter.supportsRelayProfile) {
+      const client = new Client({ name: `conformance-${adapter.id}`, version: "1.0.0" });
+      const transport = new StdioClientTransport({
+        command: reg.command,
+        args: reg.args,
+        env: { ...process.env, ...reg.env, AGENT_PAIR_NO_DASHBOARD: "1" },
+        stderr: "ignore",
+      });
+      t.after(() => client.close());
+      await client.connect(transport);
+      const { tools } = await client.listTools();
+      assert.ok(tools.some((tool) => tool.name === "team_start"));
+      assert.ok(tools.some((tool) => tool.name === "team_join"));
+    } else {
+      assert.throws(
+        () => execFileSync(reg.command, reg.args, {
+          env: { ...process.env, ...reg.env, AGENT_PAIR_NO_DASHBOARD: "1" },
+          encoding: "utf8",
+          stdio: "pipe",
+          timeout: 5000,
+          windowsHide: true,
+        }),
+        /Invalid enum value/i,
+      );
+    }
+
+    // 4. Launch and resume specs across platforms
     const sessionId = randomUUID();
     const winLaunch = adapter.launch(workspace, "Hello", "win32");
     assert.equal(winLaunch.command, `${adapter.executable}.exe`);
@@ -192,7 +237,7 @@ for (const spec of conformanceCases) {
     assert.equal(unixResume.command, adapter.executable);
     assert.ok(unixResume.args.includes(sessionId));
 
-    // 4. Session ID discovery extracts metadata without leaking private fields
+    // 5. Session ID discovery extracts metadata without leaking private fields
     const discovered = adapter.discoverSessionId(spec.validPayload(sessionId, workspace));
     const serialized = JSON.stringify(discovered);
     assert.match(serialized, new RegExp(sessionId));
@@ -201,7 +246,7 @@ for (const spec of conformanceCases) {
   });
 }
 
-test("experimental adapters are gated by default and enabled via option or env var", (t) => {
+test("experimental adapters fail closed on setupPlan without writing unusable files", (t) => {
   const prev = process.env.AGENT_PAIR_EXPERIMENTAL_ADAPTERS;
   delete process.env.AGENT_PAIR_EXPERIMENTAL_ADAPTERS;
   t.after(() => {
@@ -234,9 +279,43 @@ test("experimental adapters are gated by default and enabled via option or env v
     if (prevData === undefined) delete process.env.AGENT_PAIR_DATA_DIR;
     else process.env.AGENT_PAIR_DATA_DIR = prevData;
   });
-  const entry = join(process.cwd(), "dist", "cli.js");
-  const plan = setupPlan(entry, ["gemini"]);
-  assert.equal(plan.length, 2);
+  assert.throws(() => setupPlan(cliEntry, ["gemini"]), /Refusing to write unusable MCP configuration/i);
+  assert.equal(existsSync(join(dir, "home", ".gemini", "settings.json")), false);
+});
+
+test("resumePlan delegates through ClientAdapter for Windows and Unix", (t) => {
+  const dir = tempDir(t);
+  const workspace = join(dir, "proj");
+  const dataDir = join(dir, "data");
+  mkdirSync(workspace, { recursive: true });
+  const prevData = process.env.AGENT_PAIR_DATA_DIR;
+  process.env.AGENT_PAIR_DATA_DIR = dataDir;
+  t.after(() => {
+    if (prevData === undefined) delete process.env.AGENT_PAIR_DATA_DIR;
+    else process.env.AGENT_PAIR_DATA_DIR = prevData;
+  });
+
+  const ids = [randomUUID(), randomUUID(), randomUUID()];
+  const tag = saveSessions(dataDir, workspace, [
+    { member: "orchestrator", profile: "codex", sessionId: ids[0] },
+    { member: "worker-a", profile: "antigravity", sessionId: ids[1] },
+    { member: "worker-b", profile: "claude", sessionId: ids[2] },
+  ]);
+
+  const unixPlan = resumePlan(tag, "linux");
+  assert.deepEqual(unixPlan.commands, [
+    { member: "orchestrator", ...codexAdapter.resume(ids[0], workspace, "linux"), cwd: undefined },
+    { member: "worker-a", ...antigravityAdapter.resume(ids[1], workspace, "linux"), cwd: undefined },
+    { member: "worker-b", ...claudeAdapter.resume(ids[2], workspace, "linux"), cwd: undefined },
+  ].map(({ member, command, args }) => ({ member, command, args })));
+
+  const winPlan = resumePlan(tag, "win32");
+  assert.equal(winPlan.command, "wt.exe");
+  assert.equal(winPlan.executableIndices?.length, 3);
+  assert.deepEqual(
+    winPlan.executableIndices.map((idx) => winPlan.args[idx]),
+    ["codex.exe", "agy.exe", "claude.exe"],
+  );
 });
 
 test("registerAdapter supports custom adapters with cleanup", () => {
@@ -244,6 +323,7 @@ test("registerAdapter supports custom adapters with cleanup", () => {
     id: "custom-test",
     displayName: "Custom Test",
     experimental: false,
+    supportsRelayProfile: false,
     executable: "custom",
     setup: () => [],
     doctor: () => "custom 1.0.0",

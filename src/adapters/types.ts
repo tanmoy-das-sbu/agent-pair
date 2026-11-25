@@ -34,8 +34,10 @@ export type ClientAdapter = {
   readonly id: string;
   readonly displayName: string;
   readonly experimental: boolean;
+  readonly supportsRelayProfile: boolean;
   readonly executable: string;
   setup(context: AdapterSetupContext): AdapterSetupEdit[];
+  previewSetup?(context: AdapterSetupContext): AdapterSetupEdit[];
   doctor(platform?: NodeJS.Platform): string;
   launch(workspace: string, prompt?: string, platform?: NodeJS.Platform): AdapterCommandSpec;
   resume(sessionId: string, workspace: string, platform?: NodeJS.Platform): AdapterCommandSpec;

@@ -35,6 +35,7 @@ export const antigravityAdapter: ClientAdapter = {
   id: "antigravity",
   displayName: "Antigravity",
   experimental: false,
+  supportsRelayProfile: true,
   executable: "agy",
 
   setup(context) {

@@ -38,6 +38,11 @@ export function setupPlan(
   const skillContent = readFileSync(join(dirname(entry), "..", "skills", "agent-pair", "SKILL.md"), "utf8");
   return profiles.flatMap((profile) => {
     const adapter = getAdapter(profile, options);
+    if (!adapter.supportsRelayProfile) {
+      throw new Error(
+        `Cannot configure "${adapter.id}": this experimental adapter does not yet have a supported core relay profile (--profile ${adapter.id}). Refusing to write unusable MCP configuration.`,
+      );
+    }
     return adapter.setup({
       entry,
       configHome,

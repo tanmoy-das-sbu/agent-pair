@@ -19,9 +19,11 @@ export type ClientAdapter = {
   readonly id: string;
   readonly displayName: string;
   readonly experimental: boolean;
+  readonly supportsRelayProfile: boolean;
   readonly executable: string;
 
   setup(context: AdapterSetupContext): AdapterSetupEdit[];
+  previewSetup?(context: AdapterSetupContext): AdapterSetupEdit[];
   doctor(platform?: NodeJS.Platform): string;
   launch(workspace: string, prompt?: string, platform?: NodeJS.Platform): AdapterCommandSpec;
   resume(sessionId: string, workspace: string, platform?: NodeJS.Platform): AdapterCommandSpec;
@@ -32,10 +34,11 @@ export type ClientAdapter = {
 ### Required Invariants
 
 1. **Idempotent `setup(context)`:** Running `setup()` a second time against its own output must produce zero diffs (`edit.content === edit.original`).
-2. **Preserve foreign entries:** Never wipe unrelated MCP servers, hooks, or user settings in the client's config files.
-3. **Fail closed on unmanaged collisions:** If a user already registered an unmanaged `agent_pair` MCP server or hook, throw a clear error instead of overwriting it.
-4. **Cross-platform `launch` & `resume`:** Return `{ command, args, cwd }` using `platformCommand(executable, platform)` so Windows uses `.exe` and macOS/Linux use the bare binary name.
-5. **Minimal `discoverSessionId(payload)`:** Validate the hook payload with Zod, extract only the session UUID and workspace path(s), never leak private fields such as `transcript_path`, and return `{}` on invalid payloads.
+2. **Fail closed when relay profile is unsupported:** If `supportsRelayProfile` is `false` (i.e. `src/types.ts` `roleSchema` does not accept `--profile <id>`), `setup()` and `setupPlan()` must fail closed rather than install an unusable MCP registration. Provide `previewSetup(context)` for inspecting and conformance-testing the reference config layout.
+3. **Preserve foreign entries:** Never wipe unrelated MCP servers, hooks, or user settings in the client's config files.
+4. **Fail closed on unmanaged collisions:** If a user already registered an unmanaged `agent_pair` MCP server or hook, throw a clear error instead of overwriting it.
+5. **Cross-platform `launch` & `resume`:** Return `{ command, args, cwd }` using `platformCommand(executable, platform)` so Windows uses `.exe` and macOS/Linux use the bare binary name. `src/resume.ts` delegates directly to `getAdapter(profile).resume(sessionId, workspace, platform)`.
+6. **Minimal `discoverSessionId(payload)`:** Validate the hook payload with Zod, extract only the session UUID and workspace path(s), never leak private fields such as `transcript_path`, and return `{}` on invalid payloads.
 
 ## Experimental Adapters
 
@@ -71,9 +74,14 @@ export const myClientAdapter: ClientAdapter = {
   id: "myclient",
   displayName: "MyClient CLI (Experimental)",
   experimental: true,
+  supportsRelayProfile: false,
   executable: "myclient",
 
-  setup(context) {
+  setup() {
+    throw new Error('Experimental adapter "myclient" requires core relay profile support before installing MCP config.');
+  },
+
+  previewSetup(context) {
     const dir = join(context.configHome, ".myclient");
     return buildEdits([
       [
