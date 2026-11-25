@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -11,10 +12,278 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { captureSession } from "../dist/capture.js";
 import { Relay } from "../dist/relay.js";
+import { baseCommit, changedPaths, violations } from "../dist/git/ownership.js";
+import { transport } from "../dist/transport/index.js";
+import { saveSessions } from "../dist/bookmarks.js";
+import { resumePlan } from "../dist/resume.js";
+import { createWorktrees, mergeWorktree, cleanupWorktrees } from "../dist/git/worktrees.js";
 import { pathKey } from "../dist/workspace.js";
 
 const entry = fileURLToPath(new URL("../dist/cli.js", import.meta.url));
-const toolNames = ["pair_connect", "team_setup", "team_start", "team_join", "team_update", "pair_send", "pair_inbox", "pair_ack", "pair_status", "pair_disconnect"];
+const toolNames = ["pair_connect", "team_setup", "team_start", "team_join", "team_update", "team_merge", "team_heartbeat", "team_reassign", "pair_send", "pair_inbox", "pair_ack", "pair_status", "pair_disconnect"];
+
+test("worktrees merge independent changes and clean up safely", (t) => {
+  const { directory } = fixture(t);
+  const workspace = join(directory, "repo");
+  mkdirSync(workspace);
+  const git = (cwd, ...args) => execFileSync("git", args, { cwd, stdio: "ignore" });
+  git(workspace, "init");
+  git(workspace, "config", "user.email", "test@example.invalid");
+  git(workspace, "config", "user.name", "Test");
+  writeFileSync(join(workspace, "base"), "base");
+  git(workspace, "add", "."); git(workspace, "commit", "-m", "base");
+  const trees = createWorktrees(workspace, join(directory, "data"), randomUUID(), ["a", "b"]);
+  for (const tree of trees) {
+    writeFileSync(join(tree.path, tree.member), tree.member);
+    git(tree.path, "add", "."); git(tree.path, "commit", "-m", tree.member);
+  }
+  assert.throws(() => cleanupWorktrees(workspace, trees), /Git merge-base failed/);
+  for (const tree of trees) mergeWorktree(workspace, tree);
+  assert.equal(readFileSync(join(workspace, "a"), "utf8"), "a");
+  assert.equal(readFileSync(join(workspace, "b"), "utf8"), "b");
+  cleanupWorktrees(workspace, trees);
+  assert.equal(existsSync(trees[0].path), false);
+  assert.equal(execFileSync("git", ["branch", "--list", "agent-pair/*"], { cwd: workspace, encoding: "utf8" }).trim(), "");
+});
+
+test("worktree merge reports conflicts and preserves the branch", (t) => {
+  const { directory } = fixture(t);
+  const workspace = join(directory, "repo"); mkdirSync(workspace);
+  const git = (cwd, ...args) => execFileSync("git", args, { cwd, stdio: "ignore" });
+  git(workspace, "init"); git(workspace, "config", "user.email", "test@example.invalid"); git(workspace, "config", "user.name", "Test");
+  writeFileSync(join(workspace, "file"), "base\n"); git(workspace, "add", "."); git(workspace, "commit", "-m", "base");
+  const [tree] = createWorktrees(workspace, join(directory, "data"), randomUUID(), ["a"]);
+  writeFileSync(join(tree.path, "file"), "worker\n"); git(tree.path, "add", "."); git(tree.path, "commit", "-m", "worker");
+  writeFileSync(join(workspace, "file"), "lead\n"); git(workspace, "add", "."); git(workspace, "commit", "-m", "lead");
+  assert.throws(() => mergeWorktree(workspace, tree), /Git merge failed/);
+  assert.equal(existsSync(tree.path), true);
+  git(workspace, "merge", "--abort");
+});
+
+test("isolated team hands off and merges the worker branch", async (t) => {
+  const { directory } = fixture(t);
+  const workspace = join(directory, "repo"); mkdirSync(workspace);
+  const git = (cwd, ...args) => execFileSync("git", args, { cwd, stdio: "ignore" });
+  git(workspace, "init"); git(workspace, "config", "user.email", "test@example.invalid"); git(workspace, "config", "user.name", "Test");
+  writeFileSync(join(workspace, "base"), "base"); git(workspace, "add", "."); git(workspace, "commit", "-m", "base");
+  const relay = new Relay(join(directory, "data"));
+  const call = (request) => relay.execute(request, new AbortController().signal);
+  const assignments = [
+    { id: "lead", owner: "orchestrator", profile: "codex", title: "lead", paths: ["lead"], checks: ["test"], dependsOn: [] },
+    { id: "worker", owner: "worker", profile: "claude", title: "worker", paths: ["owned"], checks: ["test"], dependsOn: [] },
+  ];
+  const lead = await call({ action: "teamStart", role: "codex", workspace, workerCount: 1, allowedProfiles: ["claude"], assignments, enforce: "strict", isolation: "worktree" });
+  const worker = await call({ action: "teamJoin", role: "claude", workspace });
+  const update = (role, handle, transition, extra = {}) => call({ action: "teamUpdate", role, handle, taskId: "worker", transition, ...extra });
+  await update("claude", worker.handle, "start");
+  mkdirSync(join(worker.worktree, "owned")); writeFileSync(join(worker.worktree, "owned", "new"), "worker");
+  await update("claude", worker.handle, "handoff", { note: "done", checks: ["passed"] });
+  await update("codex", lead.handle, "accept");
+  await assert.rejects(call({ action: "teamMerge", role: "codex", handle: lead.handle, member: "worker" }), /Commit or remove/);
+  git(worker.worktree, "add", "."); git(worker.worktree, "commit", "-m", "worker");
+  await call({ action: "teamMerge", role: "codex", handle: lead.handle, member: "worker" });
+  assert.equal(readFileSync(join(workspace, "owned", "new"), "utf8"), "worker");
+  await call({ action: "disconnect", role: "codex", handle: lead.handle });
+  assert.equal(existsSync(worker.worktree), false);
+});
+
+test("persisted relay restores a killed process and its message log", async (t) => {
+  const { directory } = fixture(t);
+  const relayModule = new URL("../dist/relay.js", import.meta.url).href;
+  const script = `import {Relay} from ${JSON.stringify(relayModule)}; const r=new Relay(process.argv[1]); const signal=new AbortController().signal; const call=(v)=>r.execute(v,signal); const workspace=process.argv[1]; const assignments=[{id:'lead',owner:'orchestrator',profile:'codex',title:'lead',paths:['lead'],checks:['ok'],dependsOn:[]},{id:'worker',owner:'worker',profile:'claude',title:'worker',paths:['worker'],checks:['ok'],dependsOn:[]}]; const lead=await call({action:'teamStart',role:'codex',workspace,workerCount:1,allowedProfiles:['claude'],assignments,enforce:'off',persist:true}); const worker=await call({action:'teamJoin',role:'claude',workspace}); await call({action:'teamUpdate',role:'claude',handle:worker.handle,taskId:'worker',transition:'start'}); await call({action:'send',role:'claude',handle:worker.handle,taskId:'worker',kind:'update',requestId:'one',body:'saved',to:'orchestrator'}); console.log(JSON.stringify({lead,worker})); setInterval(()=>{},1000);`;
+  const child = spawn(process.execPath, ["--input-type=module", "-e", script, directory], { stdio: ["ignore", "pipe", "pipe"] });
+  const line = await new Promise((resolve, reject) => { child.stdout.once("data", (chunk) => resolve(chunk.toString())); child.once("error", reject); child.once("exit", () => reject(new Error("relay exited before ready"))); });
+  const { lead } = JSON.parse(line);
+  child.kill(); await new Promise((resolve) => child.once("exit", resolve));
+  const relay = new Relay(directory);
+  const signal = new AbortController().signal;
+  const status = await relay.execute({ action: "status", role: "codex", handle: lead.handle, waitMs: 0 }, signal);
+  assert.equal(status.tasks.find((task) => task.id === "worker").state, "active");
+  const inbox = await relay.execute({ action: "inbox", role: "codex", handle: lead.handle, waitMs: 0, limit: 20 }, signal);
+  assert.equal(inbox.messages[0].body, "saved");
+  await relay.execute({ action: "disconnect", role: "codex", handle: lead.handle }, signal);
+});
+
+test("broker restart restores persisted teams", async (t) => {
+  const { directory, env } = fixture(t);
+  let broker;
+  t.after(() => { if (broker && broker.exitCode === null) broker.kill(); });
+  const channel = transport(env.AGENT_PAIR_DATA_DIR);
+  const launch = () => { broker = spawn(process.execPath, [entry, "broker"], { env, stdio: "ignore" }); };
+  const request = async (payload) => {
+    let lastError;
+    for (let attempt = 0; attempt < 100; attempt++) {
+      try {
+        const secret = readFileSync(join(env.AGENT_PAIR_DATA_DIR, "relay.key"), "utf8");
+        return await new Promise((resolve, reject) => {
+          const socket = channel.connect(); let text = "";
+          socket.once("connect", () => socket.write(JSON.stringify({ secret, request: payload }) + "\n"));
+          socket.once("error", reject);
+          socket.on("data", (data) => { text += data; if (text.includes("\n")) { const result = JSON.parse(text); socket.destroy(); if (result.error) reject(new Error(result.error)); else resolve(result.data); } });
+        });
+      } catch (error) { lastError = error; await new Promise((resolve) => setTimeout(resolve, 50)); }
+    }
+    throw lastError;
+  };
+  const assignments = [
+    { id: "lead", owner: "orchestrator", profile: "codex", title: "lead", paths: ["lead"], checks: ["ok"] },
+    { id: "worker", owner: "worker", profile: "claude", title: "worker", paths: ["worker"], checks: ["ok"] },
+  ];
+  launch();
+  const lead = await request({ action: "teamStart", role: "codex", workspace: directory, workerCount: 1, allowedProfiles: ["claude"], assignments, enforce: "off", persist: true, noDashboard: true });
+  const worker = await request({ action: "teamJoin", role: "claude", workspace: directory });
+  await request({ action: "teamUpdate", role: "claude", handle: worker.handle, taskId: "worker", transition: "start" });
+  broker.kill(); await new Promise((resolve) => broker.once("exit", resolve));
+  launch();
+  const status = await request({ action: "status", role: "codex", handle: lead.handle, waitMs: 0 });
+  assert.equal(status.tasks.find((task) => task.id === "worker").state, "active");
+  await request({ action: "disconnect", role: "codex", handle: lead.handle });
+});
+
+test("silent workers are stalled and can be reassigned", async (t) => {
+  const { directory } = fixture(t);
+  let now = 1000;
+  const relay = new Relay(directory, () => now);
+  const call = (request) => relay.execute(request, new AbortController().signal);
+  const assignments = [
+    { id: "lead", owner: "orchestrator", profile: "codex", title: "lead", paths: ["lead"], checks: ["ok"], dependsOn: [] },
+    { id: "worker", owner: "worker", profile: "claude", title: "worker", paths: ["worker"], checks: ["ok"], dependsOn: [] },
+  ];
+  const lead = await call({ action: "teamStart", role: "codex", workspace: directory, workerCount: 1, allowedProfiles: ["claude"], assignments, enforce: "off", persist: true, stallTimeoutMs: 1000 });
+  const worker = await call({ action: "teamJoin", role: "claude", workspace: directory });
+  await call({ action: "teamUpdate", role: "claude", handle: worker.handle, taskId: "worker", transition: "start" });
+  now += 1001;
+  const status = await call({ action: "status", role: "codex", handle: lead.handle, waitMs: 0 });
+  assert.equal(status.tasks.find((task) => task.id === "worker").state, "stalled");
+  const task = await call({ action: "teamReassign", role: "codex", handle: lead.handle, taskId: "worker", member: "orchestrator" });
+  assert.equal(task.owner, "orchestrator"); assert.equal(task.state, "pending");
+  const restored = new Relay(directory, () => now);
+  const restoredStatus = await restored.execute({ action: "status", role: "codex", handle: lead.handle, waitMs: 0 }, new AbortController().signal);
+  assert.equal(restoredStatus.tasks.find((item) => item.id === "worker").owner, "orchestrator");
+});
+
+test("Unix resume plan contains the native command for each saved session", (t) => {
+  const { directory } = fixture(t);
+  const previous = process.env.AGENT_PAIR_DATA_DIR;
+  process.env.AGENT_PAIR_DATA_DIR = join(directory, "data");
+  t.after(() => { if (previous === undefined) delete process.env.AGENT_PAIR_DATA_DIR; else process.env.AGENT_PAIR_DATA_DIR = previous; });
+  const sessionId = randomUUID();
+  const workerId = randomUUID();
+  const tag = saveSessions(process.env.AGENT_PAIR_DATA_DIR, directory, [{ member: "orchestrator", profile: "codex", sessionId }, { member: "worker", profile: "claude", sessionId: workerId }]);
+  const plan = resumePlan(tag, "linux");
+  assert.deepEqual(plan.commands, [{ member: "orchestrator", command: "codex", args: ["resume", sessionId] }, { member: "worker", command: "claude", args: ["--resume", workerId] }]);
+});
+
+for (const kind of ["win32", "unix"]) {
+  test(`transport conformance: ${kind}`, { skip: (process.platform === "win32") !== (kind === "win32") ? "non-native transport" : false }, async (t) => {
+    const { directory } = fixture(t);
+    const channel = transport(directory);
+    const server = createServer((socket) => socket.end("ok"));
+    await channel.listen(server);
+    t.after(() => new Promise((resolve) => server.close(resolve)));
+    const result = await new Promise((resolve, reject) => {
+      const socket = channel.connect();
+      socket.once("error", reject);
+      socket.once("data", (data) => resolve(data.toString()));
+    });
+    assert.equal(result, "ok");
+  });
+}
+
+test("Unix transport recovers a crashed socket and preserves a live listener", { skip: process.platform === "win32" ? "requires native Unix sockets" : false }, async (t) => {
+  const { directory } = fixture(t);
+  const channel = transport(directory);
+  const modulePath = new URL("../dist/transport/index.js", import.meta.url).href;
+  const script = `import {createServer} from 'node:net'; import {transport} from ${JSON.stringify(modulePath)}; const server=createServer(); await transport(process.argv[1]).listen(server); console.log('ready');`;
+  const child = spawn(process.execPath, ["--input-type=module", "-e", script, directory], { stdio: ["ignore", "pipe", "pipe"] });
+  await new Promise((resolve, reject) => { child.stdout.once("data", resolve); child.once("error", reject); child.once("exit", () => reject(new Error("relay exited early"))); });
+  child.kill("SIGKILL");
+  await new Promise((resolve) => child.once("exit", resolve));
+  const server = createServer((socket) => socket.end("ok"));
+  await channel.listen(server);
+  t.after(() => new Promise((resolve) => server.close(resolve)));
+  const rival = createServer();
+  await assert.rejects(channel.listen(rival), (error) => error.code === "EADDRINUSE");
+  const response = await new Promise((resolve, reject) => {
+    const socket = channel.connect(); socket.once("error", reject); socket.once("data", (data) => resolve(data.toString()));
+  });
+  assert.equal(response, "ok");
+});
+
+test("ownership gate checks tracked, untracked, deleted and renamed paths", (t) => {
+  const { directory } = fixture(t);
+  const git = (...args) => execFileSync("git", args, { cwd: directory, stdio: "ignore" });
+  git("init");
+  git("config", "user.email", "test@example.invalid");
+  git("config", "user.name", "Test");
+  mkdirSync(join(directory, "owned"));
+  writeFileSync(join(directory, "owned", "old"), "old");
+  writeFileSync(join(directory, "outside"), "outside");
+  git("add", ".");
+  git("commit", "-m", "base");
+  const base = baseCommit(directory);
+  git("mv", "owned/old", "moved");
+  rmSync(join(directory, "outside"));
+  writeFileSync(join(directory, "owned", "new"), "new");
+  const paths = changedPaths(directory, base);
+  assert.deepEqual(paths, ["moved", "outside", "owned/new", "owned/old"]);
+  assert.deepEqual(violations(paths, ["owned"]), ["moved", "outside"]);
+  assert.deepEqual(violations(["ownedness/file"], ["owned"]), ["ownedness/file"]);
+});
+
+test("strict handoff rejects out-of-bound changes and exposes the violation", async (t) => {
+  const { directory } = fixture(t);
+  const git = (...args) => execFileSync("git", args, { cwd: directory, stdio: "ignore" });
+  git("init");
+  git("config", "user.email", "test@example.invalid");
+  git("config", "user.name", "Test");
+  writeFileSync(join(directory, "base"), "base");
+  git("add", ".");
+  git("commit", "-m", "base");
+  const relay = new Relay(directory);
+  const signal = new AbortController().signal;
+  const call = (request) => relay.execute(request, signal);
+  const assignments = [
+    { id: "lead", owner: "orchestrator", profile: "codex", title: "lead", paths: ["lead"], checks: ["test"], dependsOn: [] },
+    { id: "worker", owner: "worker", profile: "claude", title: "worker", paths: ["owned"], checks: ["test"], dependsOn: [] },
+  ];
+  const lead = await call({ action: "teamStart", role: "codex", workspace: directory, workerCount: 1, allowedProfiles: ["claude"], assignments, enforce: "strict" });
+  const worker = await call({ action: "teamJoin", role: "claude", workspace: directory });
+  const update = (transition, extra = {}) => call({ action: "teamUpdate", role: "claude", handle: worker.handle, taskId: "worker", transition, ...extra });
+  await update("start");
+  writeFileSync(join(directory, "outside"), "unowned");
+  await assert.rejects(update("handoff", { note: "done", checks: ["passed"] }), /outside/);
+  const status = await call({ action: "status", role: "codex", handle: lead.handle, waitMs: 0 });
+  assert.equal(status.tasks.find((task) => task.id === "worker").state, "active");
+  assert.deepEqual(status.ownershipEvents[0].files, ["outside"]);
+  rmSync(join(directory, "outside"));
+  mkdirSync(join(directory, "owned"));
+  writeFileSync(join(directory, "owned", "new"), "owned");
+  assert.equal((await update("handoff", { note: "done", checks: ["passed"] })).state, "ready");
+});
+
+test("non-Git workspaces require an explicit warn or off mode", async (t) => {
+  const { directory } = fixture(t);
+  const assignments = [
+    { id: "lead", owner: "orchestrator", profile: "codex", title: "lead", paths: ["lead"], checks: ["test"], dependsOn: [] },
+    { id: "worker", owner: "worker", profile: "claude", title: "worker", paths: ["owned"], checks: ["test"], dependsOn: [] },
+  ];
+  for (const mode of ["strict", "warn", "off"]) {
+    const relay = new Relay(directory);
+    const call = (request) => relay.execute(request, new AbortController().signal);
+    const lead = await call({ action: "teamStart", role: "codex", workspace: directory, workerCount: 1, allowedProfiles: ["claude"], assignments, enforce: mode });
+    const worker = await call({ action: "teamJoin", role: "claude", workspace: directory });
+    const update = (transition, extra = {}) => call({ action: "teamUpdate", role: "claude", handle: worker.handle, taskId: "worker", transition, ...extra });
+    if (mode === "strict") {
+      await assert.rejects(update("start"), /requires a Git workspace/);
+    } else {
+      await update("start");
+      await update("handoff", { note: "done", checks: ["passed"] });
+      const status = await call({ action: "status", role: "codex", handle: lead.handle, waitMs: 0 });
+      assert.equal(status.ownershipEvents.length, mode === "warn" ? 1 : 0);
+    }
+  }
+});
 
 function fixture(t) {
   const parent = realpathSync(tmpdir());
@@ -49,6 +318,7 @@ async function openClient(role, env) {
 }
 
 async function tool(client, name, args) {
+  if (name === "team_start") args = { enforce: "off", ...args };
   const result = await client.callTool({ name, arguments: args });
   const text = result.content[0].text;
   if (result.isError) throw new Error(text);
@@ -414,6 +684,9 @@ test("serves a token-gated local browser dashboard with live SSE team state upda
   const initial = await nextSnapshot();
   assert.deepEqual(initial.runs, []);
   assert.deepEqual(initial.setups, []);
+  assert.deepEqual(await tool(lead, "team_setup", { workspace }), {
+    currentProfile: "codex", setup: null, dashboardUrl: url,
+  });
 
   const setupInput = { workspace, leadProfile: "codex", workers: { codex: 0, antigravity: 1, claude: 0 } };
   const postSetup = (input, requestOrigin = origin) => fetch(`${url}api/setup`, {

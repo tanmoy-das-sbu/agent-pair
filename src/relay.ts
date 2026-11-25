@@ -4,6 +4,9 @@ import { saveBookmark, saveSessions } from "./bookmarks.js";
 import { leader, Team } from "./team.js";
 import { otherRole, roles, type PairRole, type Request, type Role, type TeamSetupInput } from "./types.js";
 import { pathKey, workspaceRoot } from "./workspace.js";
+import { baseCommit, changedPaths, violations } from "./git/ownership.js";
+import { cleanupWorktrees, createWorktrees, mergeWorktree, type WorkerTree } from "./git/worktrees.js";
+import { loadRuns, removeRun, saveRun } from "./core/persistence.js";
 
 export type AgentActivityState =
   | "waiting"
@@ -36,7 +39,7 @@ export type DashboardTask = {
   paths: string[];
   checks: string[];
   dependsOn: string[];
-  state: "pending" | "active" | "blocked" | "ready" | "accepted";
+  state: "pending" | "active" | "blocked" | "stalled" | "ready" | "accepted";
   note?: string;
   evidence?: string[];
 };
@@ -54,6 +57,8 @@ export type DashboardMessage = {
   acknowledged: boolean;
 };
 
+export type RunEvent = { id: number; timestamp: number; runId: string; type: string; member?: string; taskId?: string; data?: Record<string, unknown> };
+
 export type DashboardRun = {
   id: string;
   mode: "team" | "pair";
@@ -68,6 +73,8 @@ export type DashboardRun = {
   members: DashboardMember[];
   tasks: DashboardTask[];
   messages: DashboardMessage[];
+  events: RunEvent[];
+  ownershipEvents?: { type: "ownership.violation"; taskId: string; files: string[]; at: number }[];
 };
 
 export type DashboardSnapshot = {
@@ -111,6 +118,19 @@ type Run = {
   listeners: Set<() => void>;
   createdAt: number;
   expires: number;
+  enforcement?: "strict" | "warn" | "off";
+  taskBases?: Map<string, string>;
+  ownershipEvents?: { type: "ownership.violation"; taskId: string; files: string[]; at: number }[];
+  events: RunEvent[];
+  worktrees?: WorkerTree[];
+  persist?: boolean;
+  stallTimeoutMs?: number;
+};
+
+type SavedRun = Omit<Run, "team" | "handles" | "claimed" | "lastActivity" | "requests" | "acknowledged" | "listeners" | "taskBases"> & {
+  handles: [string, string][]; claimed: string[]; lastActivity: [string, number][];
+  requests: [string, { message: Message; fingerprint: string }][]; acknowledged: number[]; taskBases: [string, string][];
+  team: { tasks: DashboardTask[]; members: [string, { profile: Role; sessionId?: string }][]; workerCount: number; allowedProfiles: Role[] };
 };
 
 function waitForChange(listeners: Set<() => void>, milliseconds: number, signal: AbortSignal): Promise<void> {
@@ -136,7 +156,29 @@ export class Relay {
   private readonly setups = new Map<string, TeamSetup>();
   private readonly lifetime = 30 * 60 * 1000;
 
-  constructor(private readonly directory: string, private readonly now: () => number = Date.now) {}
+  constructor(private readonly directory: string, private readonly now: () => number = Date.now) {
+    for (const raw of loadRuns(directory)) {
+      const saved = raw as SavedRun;
+      const lead = saved.team.members.find(([member]) => member === leader)?.[1];
+      if (!lead) throw new Error("Persisted team is missing its orchestrator.");
+      const assignments = [...saved.team.tasks];
+      const temporaryIds: string[] = [];
+      for (const [id, slot] of saved.team.members) {
+        if (assignments.some((task) => task.owner === id)) continue;
+        let temporary = `restore-${id}`;
+        while (assignments.some((task) => task.id === temporary)) temporary += "x";
+        temporaryIds.push(temporary);
+        assignments.push({ id: temporary, owner: id, profile: slot.profile, title: "restore", paths: [], checks: ["restore"], dependsOn: [], state: "pending" });
+      }
+      const team = new Team(lead.profile, lead.sessionId, assignments, saved.team.workerCount, saved.team.allowedProfiles);
+      for (const id of temporaryIds) team.tasks.delete(id);
+      for (const [id, member] of saved.team.members) team.members.set(id, member);
+      for (const task of saved.team.tasks) Object.assign(team.tasks.get(task.id)!, task);
+      const run: Run = { ...saved, team, handles: new Map(saved.handles), claimed: new Set(saved.claimed), lastActivity: new Map(saved.lastActivity), requests: new Map(saved.requests), acknowledged: new Set(saved.acknowledged), listeners: new Set(), taskBases: new Map(saved.taskBases) };
+      this.runs.set(run.id, run);
+      for (const [member, handle] of run.handles) this.handles.set(handle, { member, role: team.members.get(member)!.profile, run });
+    }
+  }
 
   subscribe(listener: () => void): () => void {
     this.observers.add(listener);
@@ -144,6 +186,9 @@ export class Relay {
   }
 
   private notifyObservers(): void {
+    for (const run of this.runs.values()) if (run.persist && run.team) {
+      saveRun(this.directory, run.id, { ...run, team: { tasks: [...run.team.tasks.values()], members: [...run.team.members], workerCount: run.team.workerCount, allowedProfiles: run.team.allowedProfiles }, handles: [...run.handles], claimed: [...run.claimed], lastActivity: [...run.lastActivity], requests: [...run.requests], acknowledged: [...run.acknowledged], listeners: undefined, taskBases: [...(run.taskBases ?? [])] });
+    }
     for (const observer of this.observers) observer();
   }
 
@@ -184,7 +229,7 @@ export class Relay {
           const claimed = run.claimed.has(id);
           const owned = tasks.filter((task) => task.owner === id);
           const active = owned.find((task) => task.state === "active");
-          const blocked = owned.find((task) => task.state === "blocked");
+          const blocked = owned.find((task) => task.state === "blocked" || task.state === "stalled");
           const ready = owned.find((task) => task.state === "ready");
           const allAccepted = owned.length > 0 && owned.every((task) => task.state === "accepted");
           let status: AgentActivityState;
@@ -224,6 +269,8 @@ export class Relay {
           members,
           tasks,
           messages,
+          events: run.events,
+          ownershipEvents: run.ownershipEvents,
         };
       }
       const members: DashboardMember[] = (["codex", "antigravity"] as const).map((role) => {
@@ -254,6 +301,7 @@ export class Relay {
         members,
         tasks: [],
         messages,
+        events: run.events,
       };
     });
     const pendingPairs = [...this.pending.values()].map((entry) => ({
@@ -273,7 +321,24 @@ export class Relay {
     }
     if (setupExpired) this.notifyObservers();
     for (const run of this.runs.values()) {
-      if (run.expires <= this.now()) this.close(run.id);
+      if (run.team && run.stallTimeoutMs) {
+        let changed = false;
+        for (const task of run.team.tasks.values()) {
+          if (task.state === "active" && this.now() - (run.lastActivity.get(task.owner) ?? run.createdAt) >= run.stallTimeoutMs) {
+            task.state = "stalled";
+            this.event(run, "task.stalled", task.owner, task.id, { state: "stalled" });
+            changed = true;
+          }
+        }
+        if (changed) this.notifyObservers();
+      }
+      if (run.expires <= this.now()) {
+        try { this.close(run.id); }
+        catch {
+          // Preserve dirty or unmerged worktrees and keep the relay usable for recovery.
+          run.expires = this.now() + this.lifetime;
+        }
+      }
     }
   }
 
@@ -328,9 +393,73 @@ export class Relay {
         return this.send(run, member, request);
       case "teamUpdate": {
         if (!run.team) throw new Error("Task transitions are available in team runs.");
+        const task = run.team.tasks.get(request.taskId);
+        const taskWorkspace = run.worktrees?.find((tree) => tree.member === task?.owner)?.path ?? run.workspace;
+        if (request.transition === "start" && task?.owner === member && ["pending", "blocked", "stalled"].includes(task.state)
+          && task.dependsOn.every((id) => run.team!.tasks.get(id)?.state === "accepted")
+          && !run.taskBases!.has(task.id) && run.enforcement !== "off") {
+          try { run.taskBases!.set(task.id, baseCommit(taskWorkspace)); }
+          catch (error) { if (run.enforcement === "strict") throw error; }
+        }
+        if (request.transition === "handoff" && task?.owner === member && task.state === "active"
+          && request.note && request.checks?.length && run.enforcement !== "off") {
+          let files: string[];
+          try {
+            const base = run.taskBases!.get(task.id);
+            if (!base) throw new Error("Ownership enforcement requires a Git workspace with a base commit.");
+            files = violations(changedPaths(taskWorkspace, base), task.paths);
+          } catch (error) {
+            if (run.enforcement === "strict") throw error;
+            files = ["<unable to inspect Git changes>"];
+          }
+          if (files.length) {
+            run.ownershipEvents!.push({ type: "ownership.violation", taskId: task.id, files, at: this.now() });
+            this.event(run, "ownership.violation", member, task.id, { files, mode: run.enforcement, rejected: run.enforcement === "strict" });
+            this.notifyObservers();
+            if (run.enforcement === "strict") throw new Error(`Ownership violation; changed paths outside task boundary: ${files.join(", ")}`);
+          }
+        }
+        const previousState = task?.state;
         const updated = run.team.update(member, request);
+        if (previousState !== updated.state) {
+          const types = { start: "task.started", block: "task.blocked", handoff: "task.handoff", accept: "task.accepted", revise: "task.revised" };
+          this.event(run, types[request.transition], member, updated.id, { state: updated.state, note: updated.note, checks: updated.evidence });
+        }
         this.notifyObservers();
         return updated;
+      }
+      case "heartbeat":
+        this.notifyObservers();
+        return { at: run.lastActivity.get(member) };
+      case "teamReassign": {
+        if (member !== leader || !run.team) throw new Error("Only the orchestrator can reassign tasks.");
+        if (run.worktrees) throw new Error("Reassignment of isolated worktrees requires manual recovery.");
+        const task = run.team.tasks.get(request.taskId);
+        const target = run.team.members.get(request.member);
+        if (!task || task.state !== "stalled" || !target || !run.handles.has(request.member)) throw new Error("Select a stalled task and connected team member.");
+        const overlaps = (a: string, b: string) => a === "." || b === "." || a === b || a.startsWith(b + "/") || b.startsWith(a + "/");
+        if ([...run.team.tasks.values()].some((other) => other !== task && other.owner !== request.member
+          && task.paths.some((a) => other.paths.some((b) => overlaps(process.platform === "win32" ? a.toLowerCase() : a, process.platform === "win32" ? b.toLowerCase() : b))))) {
+          throw new Error("Reassignment would overlap another owner's paths.");
+        }
+        task.owner = request.member;
+        task.profile = target.profile;
+        task.state = "pending";
+        this.event(run, "task.reassigned", member, task.id, { owner: request.member, state: task.state });
+        this.notifyObservers();
+        return task;
+      }
+      case "teamMerge": {
+        if (member !== leader || !run.team) throw new Error("Only the orchestrator can merge worker worktrees.");
+        const tree = run.worktrees?.find((entry) => entry.member === request.member);
+        if (!tree) throw new Error("No worktree for this member.");
+        if ([...run.team.tasks.values()].some((task) => task.owner === request.member && task.state !== "accepted")) {
+          throw new Error("All worker tasks must be accepted before merge.");
+        }
+        mergeWorktree(run.workspace, tree);
+        this.event(run, "worktree.merged", member, undefined, { worker: request.member, branch: tree.branch });
+        this.notifyObservers();
+        return { merged: request.member, branch: tree.branch };
       }
       case "inbox": {
         const deadline = Date.now() + request.waitMs;
@@ -347,7 +476,10 @@ export class Relay {
         if (ids.some((id) => run.messages[id - 1]?.to !== member)) {
           throw new Error("You can acknowledge only messages sent to this session.");
         }
-        for (const id of ids) run.acknowledged.add(id);
+        for (const id of ids) {
+          if (!run.acknowledged.has(id)) this.event(run, "message.acked", member, run.messages[id - 1]?.taskId, { messageId: id });
+          run.acknowledged.add(id);
+        }
         this.notifyObservers();
         return { acknowledged: ids };
       }
@@ -374,6 +506,7 @@ export class Relay {
       }
       case "disconnect":
         if (run.team && member !== leader) {
+          this.event(run, "member.disconnected", member);
           this.handles.delete(request.handle);
           run.handles.delete(member);
           for (const listener of run.listeners) listener();
@@ -451,8 +584,10 @@ export class Relay {
       id: randomUUID(), workspace, team, handles: new Map(), claimed: new Set(), lastActivity: new Map(),
       messages: [], requests: new Map(),
       acknowledged: new Set(), listeners: new Set(), createdAt: timestamp, expires: timestamp + this.lifetime,
+      events: [],
     };
     this.runs.set(run.id, run);
+    this.event(run, "run.started");
     return run;
   }
 
@@ -462,6 +597,7 @@ export class Relay {
     run.claimed.add(member);
     run.lastActivity.set(member, this.now());
     this.handles.set(handle, { role, member, run });
+    this.event(run, "member.joined", member, undefined, { profile: role });
     return handle;
   }
 
@@ -481,6 +617,15 @@ export class Relay {
       this.setups.delete(key);
     }
     const run = this.createRun(workspace, team);
+    run.enforcement = request.enforce ?? "strict";
+    run.taskBases = new Map();
+    run.ownershipEvents = [];
+    run.persist = request.persist ?? false;
+    run.stallTimeoutMs = request.stallTimeoutMs;
+    if (request.isolation === "worktree") {
+      try { run.worktrees = createWorktrees(workspace, this.directory, run.id, [...team.members.keys()].filter((member) => member !== leader)); }
+      catch (error) { this.runs.delete(run.id); throw error; }
+    }
     const handle = this.addMember(run, leader, request.role);
     this.notifyObservers();
     return { ...this.teamStatus(run, leader), handle };
@@ -492,7 +637,7 @@ export class Relay {
       candidate.team && pathKey(candidate.workspace) === pathKey(root) && (!runId || candidate.id === runId));
     if (candidates.length !== 1) {
       throw new Error(candidates.length ? "More than one team is active in this workspace. Include the run ID."
-        : "No active team is waiting in this workspace.");
+        : "No active team is waiting in this workspace on this relay. Make sure every client uses the same Agent Pair installation and AGENT_PAIR_DATA_DIR, then restart the clients after an update. Start the dashboard from a normal terminal before opening the team if sandboxed sessions cannot share the relay.");
     }
     const run = candidates[0];
     const team = run?.team;
@@ -539,12 +684,15 @@ export class Relay {
       .map(([id]) => id);
     return {
       runId: run.id, workspace: run.workspace, member, tag: run.tag, bookmarkError: run.bookmarkError,
+      worktree: run.worktrees?.find((tree) => tree.member === member)?.path,
       waitingFor: [...team.members.keys()].filter((id) => !run.claimed.has(id)).length,
       unread: this.unread(run, member, taskId).length,
       members: [...team.members].map(([id, slot]) => ({
         member: id, profile: slot.profile, connected: run.handles.has(id), hasSessionId: Boolean(slot.sessionId),
       })),
       ...(missingSessionIds.length ? { missingSessionIds } : {}),
+      ownershipEvents: run.ownershipEvents,
+      events: run.events,
       tasks: [...team.tasks.values()].filter((task) => !taskId || task.id === taskId),
     };
   }
@@ -580,6 +728,7 @@ export class Relay {
       from: member, to, createdAt: new Date().toISOString(),
     };
     run.messages.push(message);
+    this.event(run, "message.sent", member, taskId, { message });
     run.requests.set(retryKey, { message, fingerprint });
     for (const listener of run.listeners) listener();
     this.notifyObservers();
@@ -591,10 +740,16 @@ export class Relay {
       && (!taskId || taskId === message.taskId));
   }
 
+  private event(run: Run, type: string, member?: string, taskId?: string, data?: Record<string, unknown>): void {
+    run.events.push({ id: run.events.length + 1, timestamp: this.now(), runId: run.id, type, member, taskId, data });
+  }
+
   private close(id: string): { closed: boolean } {
     const run = this.runs.get(id);
     if (!run) return { closed: false };
+    if (run.worktrees) cleanupWorktrees(run.workspace, run.worktrees);
     this.runs.delete(id);
+    if (run.persist) removeRun(this.directory, id);
     for (const handle of run.handles.values()) this.handles.delete(handle);
     for (const listener of run.listeners) listener();
     this.notifyObservers();

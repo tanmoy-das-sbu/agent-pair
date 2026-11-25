@@ -1,10 +1,12 @@
 # Agent Pair
 
+[![CI](https://github.com/tanmoy-das-sbu/agent-pair/actions/workflows/ci.yml/badge.svg)](https://github.com/tanmoy-das-sbu/agent-pair/actions/workflows/ci.yml) [![npm version](https://img.shields.io/npm/v/%40tnmy57%2Fagent-pair)](https://www.npmjs.com/package/@tnmy57/agent-pair) [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
+
 Coordinate multiple Codex, Google Antigravity, and Claude Code sessions in one workspace with explicit task ownership, dependency gating, directed messaging, and a live local dashboard.
 
-## Demo
+![Agent Pair dashboard demo showing the team map, task states, and dependencies](docs/media/team-map-demo.gif)
 
-> **[Demo placeholder]** Add a short screen recording or screenshot of the live Team Map, task board, and multi-agent handoff flow here once the v0.4 dashboard views are captured.
+The recording shows the dashboard's built-in demo data, not a live run. [GitHub repository](https://github.com/tanmoy-das-sbu/agent-pair) · [Architecture and case study](docs/CASE_STUDY.md)
 
 ## Quickstart
 
@@ -47,6 +49,12 @@ When a team starts, Agent Pair launches a token-gated local browser dashboard sh
 - Use **Set up a team** in the dashboard to configure a workspace folder, lead client, and worker counts per client (pending setups expire after 30 minutes).
 - Use **Preview Team Map Demo** to inspect the Team Map before starting a live run.
 
+### Troubleshooting team connections
+
+All sessions in a team need the same Agent Pair installation and `AGENT_PAIR_DATA_DIR`. After updating or rebuilding Agent Pair, restart the client sessions and their MCP servers: an already running MCP server continues to use the code it loaded at startup. A dashboard from another relay or version will not share its pending setups or teams.
+
+On Windows, a relay started inside a restricted sandbox can create a named pipe that other clients cannot access. If a join fails with `EPERM` or access denied, close the affected team, then start the dashboard from a normal terminal using `node dist/cli.js dashboard --no-open` in a source checkout (or `agent-pair dashboard --no-open` for an installed package). Open the printed URL, start fresh client sessions, and use the same workspace and data directory. `agent-pair doctor` checks whether client registrations are up to date. Do not change sandbox permissions just to silence the error.
+
 ### Pair Codex and Antigravity (two-agent mode)
 
 Open the same folder in fresh Codex and Antigravity sessions and give both the same prompt:
@@ -83,18 +91,18 @@ node dist/cli.js --help
 
 Each agent session runs a stdio MCP server (`agent-pair serve --profile <client>`) that communicates with a shared local relay over local IPC. The relay tracks run rosters, task state transitions, and directed messages, and serves SSE snapshots to the local dashboard.
 
-See `plan.md` (bundled as `PLAN.md` in the npm package) for the full architecture diagrams, verification matrix, and v0.4 roadmap.
+See the [case study](docs/CASE_STUDY.md) for the problem, architecture, design choices, and failures encountered, and [PLAN.md](PLAN.md) for the execution plan and verification matrix.
 
-## Limitations
+## Limitations and threat model
 
-- **Advisory file ownership (until A1 lands):** Today, the relay rejects overlapping owned paths when a team starts, but it does **not** inspect `git diff` at handoff time. File boundaries rely on agents respecting their assigned paths until strict handoff verification (task A1) is implemented.
-- **Shared working tree by default:** Workers currently edit files in the same repository checkout without per-worker git worktree isolation (planned in A3), so accidental edits to shared or generated files can collide.
-- **Ephemeral in-memory coordination state:** Active runs, task states, and messages live in memory and are lost if the relay process restarts or expires after 30 minutes of inactivity (crash recovery and persistence are planned in A4).
-- **Platform maturity:** Primary verification so far has been on Windows with Windows Terminal (`wt.exe`) for `resume`. Cross-platform Unix socket transport hardening and non-Windows resume launchers are planned in A2.
-- **No automatic token/cost capture:** Agent Pair coordinates over MCP and does not wrap model API calls; token and cost metrics depend on agents or wrappers reporting them (planned in B2).
+- **Ownership checks have limits:** Strict mode compares Git changes to owned paths. In a shared checkout it includes pre-existing and other workers' changes and cannot identify who made them. Ignored files are not covered; glob paths are rejected.
+- **Shared working tree by default:** Optional worktree isolation exists, but dirty or unmerged worktrees require manual recovery; they are not forcibly discarded.
+- **State and recovery:** Coordination is in memory by default and active runs expire after 30 minutes of inactivity. Persistence and stall detection are optional; clients must send heartbeats for stall detection to be meaningful.
+- **Platform maturity:** Primary verification so far has been on Windows. Unix transport and tmux support need native verification, and restrictive Windows sandboxes can prevent clients from accessing a relay pipe.
+- **No automatic token/cost capture:** Agents or wrappers must report usage; absent data is shown as unreported.
 - **Node.js 24+ requirement:** Older Node LTS releases (including Node 20) are unsupported because `node:sqlite` and `URL.parse` are used directly.
 
-## Threat Model
+### Threat model
 
 Agent Pair is designed for **single-user local developer workstations**, not multi-tenant or untrusted network hosts.
 
@@ -104,11 +112,11 @@ Agent Pair is designed for **single-user local developer workstations**, not mul
 - **Loopback-only, token-gated dashboard:** The HTTP dashboard binds strictly to `127.0.0.1` with a fresh 128-bit random URL token per relay start, strict `Content-Security-Policy` with per-response script nonces, `Referrer-Policy: no-referrer`, and `Origin` header validation on mutating setup/picker routes.
 - **Scoped session handles:** Each connected member receives a random 256-bit handle scoped to its run, member ID, and client profile; cross-session message reads, acknowledgments, and unauthorized task transitions are rejected.
 - **Workspace-relative path validation:** Task path declarations reject absolute paths, `..` traversal, and invalid control characters.
-- **Minimal persisted metadata:** `bookmarks.sqlite` stores only workspace paths, member IDs, client profiles, and native session UUIDs—never task notes or message bodies.
+- **Local data:** Bookmarks store workspace paths and native session IDs. If enabled, run snapshots can include handles, task notes, and messages; metrics and timeline recordings also contain run data. Protect the local data directory accordingly.
 
 ### Known gaps and residual risks
 
-- **Honor-system file boundaries until A1 lands:** Because the current relay does not verify working-tree diffs on `team_update(transition: "handoff")`, a buggy, prompt-injected, or non-compliant agent can modify files outside its assigned paths—including security-sensitive files, CI workflows, or another worker's code—and still submit a handoff. Automated `git diff` enforcement at handoff (task A1) and worktree isolation (task A3) are required to close this gap.
+- **File boundaries are not a sandbox:** A buggy, prompt-injected, or non-compliant agent retains its native client permissions. Diff checks happen at handoff and cannot prevent edits, cover ignored files, or reliably attribute changes in a shared checkout.
 - **Same-user local privilege boundary:** Any local process running as the same OS user that can read `relay.key` in the Agent Pair data directory can authenticate to the local relay, inspect active runs, or send/close runs.
 - **Dashboard capability URL exposure:** The dashboard token lives in the URL path (`/d/<token>/`). Anyone with access to your screen, browser history, or local command output displaying `agent-pair dashboard` can view active runs and create/cancel pending setups until the relay restarts.
 - **Native agent execution trust:** Agent Pair does not sandbox the underlying coding agents (Codex, Antigravity, Claude Code). Each agent retains whatever filesystem, shell, and network permissions its native client grants.

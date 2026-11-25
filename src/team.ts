@@ -3,7 +3,7 @@ import { type Assignment, type Request, type Role } from "./types.js";
 
 export const leader = "orchestrator";
 type Update = Extract<Request, { action: "teamUpdate" }>;
-type TaskState = "pending" | "active" | "blocked" | "ready" | "accepted";
+type TaskState = "pending" | "active" | "blocked" | "stalled" | "ready" | "accepted";
 type Task = Assignment & {
   dependsOn: string[];
   state: TaskState;
@@ -87,7 +87,7 @@ export class Team {
       throw new Error("Include a handoff summary and the results of your checks.");
     }
     const states: Record<Update["transition"], { from: TaskState[]; to: TaskState }> = {
-      start: { from: ["pending", "blocked"], to: "active" },
+      start: { from: ["pending", "blocked", "stalled"], to: "active" },
       block: { from: ["active"], to: "blocked" },
       handoff: { from: ["active"], to: "ready" },
       accept: { from: ["ready"], to: "accepted" },

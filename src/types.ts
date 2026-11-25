@@ -41,6 +41,10 @@ export type TeamSetupInput = z.infer<typeof teamSetupSchema>;
 export const teamSetupFields = { workspace };
 export const teamStartFields = {
   workspace,
+  enforce: z.enum(["strict", "warn", "off"]).default("strict"),
+  isolation: z.enum(["shared", "worktree"]).default("shared"),
+  persist: z.boolean().default(false),
+  stallTimeoutMs: z.number().int().min(1000).max(86400000).optional(),
   setupId: z.string().uuid().optional(),
   sessionId: sessionId.optional(),
   workerCount: z.number().int().min(1).max(63),
@@ -79,12 +83,18 @@ export const inboxFields = {
 export const ackFields = { handle, ids: z.array(messageId).min(1).max(40) };
 export const statusFields = { handle, taskId: identifier.optional(), waitMs: inboxFields.waitMs };
 export const disconnectFields = { handle };
+export const mergeFields = { handle, member };
+export const heartbeatFields = { handle };
+export const reassignFields = { handle, taskId: member, member };
 export const requestSchema = z.discriminatedUnion("action", [
   z.object({ action: z.literal("connect"), role: roleSchema, ...connectFields }),
   z.object({ action: z.literal("teamSetup"), role: roleSchema, ...teamSetupFields }),
   z.object({ action: z.literal("teamStart"), role: roleSchema, noDashboard: z.boolean().optional(), ...teamStartFields }),
   z.object({ action: z.literal("teamJoin"), role: roleSchema, ...teamJoinFields }),
   z.object({ action: z.literal("teamUpdate"), role: roleSchema, ...teamUpdateFields }),
+  z.object({ action: z.literal("teamMerge"), role: roleSchema, ...mergeFields }),
+  z.object({ action: z.literal("heartbeat"), role: roleSchema, ...heartbeatFields }),
+  z.object({ action: z.literal("teamReassign"), role: roleSchema, ...reassignFields }),
   z.object({ action: z.literal("send"), role: roleSchema, ...sendFields }),
   z.object({ action: z.literal("inbox"), role: roleSchema, ...inboxFields }),
   z.object({ action: z.literal("ack"), role: roleSchema, ...ackFields }),

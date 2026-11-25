@@ -2,13 +2,13 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { relayCall } from "./ipc.js";
 import {
-  ackFields, connectFields, disconnectFields, inboxFields, sendFields, statusFields,
+  ackFields, connectFields, disconnectFields, heartbeatFields, inboxFields, mergeFields, reassignFields, sendFields, statusFields,
   teamJoinFields, teamSetupFields, teamStartFields, teamUpdateFields,
   type Request, type Role,
 } from "./types.js";
 
 export async function serve(entry: string, role: Role): Promise<void> {
-  const server = new McpServer({ name: "agent-pair", version: "0.3.0" });
+  const server = new McpServer({ name: "agent-pair", version: "0.4.0" });
   const invoke = async (request: Request, signal: AbortSignal) => {
     try {
       const result = await relayCall(entry, request, signal);
@@ -26,7 +26,7 @@ export async function serve(entry: string, role: Role): Promise<void> {
   }, (input, extra) => invoke({ action: "connect", role, ...input }, extra.signal));
   const suppressDashboard = process.env.AGENT_PAIR_NO_DASHBOARD === "1" || process.env.AGENT_PAIR_DASHBOARD === "0";
   server.registerTool("team_setup", {
-    description: "Look up the dashboard team setup for the current workspace and identify your client profile.",
+    description: "Look up this workspace's team setup and identify your client profile. If no setup exists, dashboardUrl points to the dashboard served by this session's relay.",
     inputSchema: teamSetupFields,
   }, (input, extra) => invoke({ action: "teamSetup", role, ...input }, extra.signal));
   server.registerTool("team_start", {
@@ -46,6 +46,16 @@ export async function serve(entry: string, role: Role): Promise<void> {
     description: "Start, block, or hand off an owned task. The orchestrator can accept a handoff or request revision. Dependencies must be accepted before starting. Handoffs include a note and check results.",
     inputSchema: teamUpdateFields,
   }, (input, extra) => invoke({ action: "teamUpdate", role, ...input }, extra.signal));
+  server.registerTool("team_merge", {
+    description: "Merge a reviewed worker worktree into the orchestrator checkout.",
+    inputSchema: mergeFields,
+  }, (input, extra) => invoke({ action: "teamMerge", role, ...input }, extra.signal));
+  server.registerTool("team_heartbeat", {
+    description: "Report activity for stall detection in the current team.", inputSchema: heartbeatFields,
+  }, (input, extra) => invoke({ action: "heartbeat", role, ...input }, extra.signal));
+  server.registerTool("team_reassign", {
+    description: "Reassign a stalled task when its file boundaries remain exclusive.", inputSchema: reassignFields,
+  }, (input, extra) => invoke({ action: "teamReassign", role, ...input }, extra.signal));
   server.registerTool("pair_send", {
     description: "Send a message to another member of this run. Supply to with the recipient's member ID to address a specific teammate.",
     inputSchema: sendFields,

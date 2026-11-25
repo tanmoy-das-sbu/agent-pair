@@ -1,7 +1,12 @@
 {
   "name": "@tnmy57/agent-pair",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Coordinate Codex, Antigravity, and Claude Code sessions in one workspace",
+  "license": "MIT",
+  "repository": { "type": "git", "url": "git+https://github.com/tanmoy-das-sbu/agent-pair.git" },
+  "bugs": { "url": "https://github.com/tanmoy-das-sbu/agent-pair/issues" },
+  "homepage": "https://github.com/tanmoy-das-sbu/agent-pair#readme",
+  "keywords": ["mcp", "multi-agent", "codex", "claude-code", "antigravity", "ai-agents", "orchestration", "developer-tools"],
   "type": "module",
   "bin": {
     "agent-pair": "dist/cli.js"
@@ -10,6 +15,8 @@
     "dist",
     "skills",
     "templates",
+    "bench",
+    "docs",
     "README.md",
     "PLAN.md"
   ],
@@ -22,7 +29,7 @@
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",
-    "test": "npm run build && node --test test/*.test.mjs",
+    "test": "npm run build && node --test test/*.test.mjs test/*/*.test.mjs bench/*.test.mjs",
     "prepack": "npm run build"
   },
   "dependencies": {

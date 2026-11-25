@@ -1,23 +1,16 @@
 import { spawn } from "node:child_process";
-import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
+import { randomBytes, timingSafeEqual } from "node:crypto";
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { createConnection, createServer } from "node:net";
-import { tmpdir } from "node:os";
+import { createServer } from "node:net";
 import { join } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 import { DashboardServer, openDashboardUrl } from "./dashboard.js";
 import { Relay } from "./relay.js";
 import { requestSchema, type Request } from "./types.js";
-import { dataDirectory, pathKey } from "./workspace.js";
+import { dataDirectory } from "./workspace.js";
+import { transport, type Transport } from "./transport/index.js";
 
 const maxFrame = 1024 * 1024;
-
-function endpoint(directory: string): string {
-  const hash = createHash("sha256").update("agent-pair-relay-v9\0").update(pathKey(directory)).digest("hex").slice(0, 24);
-  if (process.platform === "win32") return `\\\\.\\pipe\\agent-pair-${hash}`;
-  if (process.platform === "linux") return `\0agent-pair-${hash}`;
-  return join(tmpdir(), `agent-pair-${hash}.sock`);
-}
 
 async function brokerSecret(directory: string): Promise<string> {
   mkdirSync(directory, { recursive: true, mode: 0o700 });
@@ -79,11 +72,13 @@ export async function runBroker(): Promise<void> {
           data = await relay.execute(request.data, controller.signal);
           const allowAutoOpen = request.data.action === "teamStart"
             && !request.data.noDashboard;
-          if (allowAutoOpen && data && typeof data === "object") {
+          const missingSetup = request.data.action === "teamSetup" && data && typeof data === "object"
+            && "setup" in data && data.setup === null;
+          if ((allowAutoOpen || missingSetup) && data && typeof data === "object") {
             try {
               const url = await dashboard.ensureStarted();
               (data as Record<string, unknown>).dashboardUrl = url;
-              if (!dashboard.hasClients) openDashboardUrl(url);
+              if (allowAutoOpen && !dashboard.hasClients) openDashboardUrl(url);
             } catch {
               // Dashboard launch is optional and must not interrupt team startup.
             }
@@ -98,16 +93,14 @@ export async function runBroker(): Promise<void> {
     socket.on("data", onData);
   });
 
-  await new Promise<void>((resolve, reject) => {
-    server.once("error", reject);
-    server.listen(endpoint(directory), resolve);
-  }).catch((error: NodeJS.ErrnoException) => {
+  await transport(directory).listen(server).catch((error: NodeJS.ErrnoException) => {
     if (error.code !== "EADDRINUSE") throw error;
   });
   if (!server.listening) return;
   const timer = setInterval(() => {
     relay.sweep();
-    if (relay.idle && !dashboard.hasClients && Date.now() - lastCall > 60_000) server.close();
+    const idleTimeout = dashboard.isStarted ? 30 * 60_000 : 60_000;
+    if (relay.idle && !dashboard.hasClients && Date.now() - lastCall > idleTimeout) server.close();
   }, 5000);
   server.once("close", () => {
     clearInterval(timer);
@@ -115,10 +108,10 @@ export async function runBroker(): Promise<void> {
   });
 }
 
-function call(path: string, secret: string, request: Request, signal?: AbortSignal): Promise<unknown> {
+function call(channel: Transport, secret: string, request: Request, signal?: AbortSignal): Promise<unknown> {
   signal?.throwIfAborted();
   return new Promise((resolve, reject) => {
-    const socket = createConnection(path);
+    const socket = channel.connect();
     const abort = () => socket.destroy(new Error("Agent Pair tool call canceled."));
     signal?.addEventListener("abort", abort, { once: true });
     socket.setTimeout(31_000, () => socket.destroy(new Error("Agent Pair relay did not respond.")));
@@ -154,14 +147,21 @@ function unavailable(error: unknown): boolean {
   return ["ENOENT", "ECONNREFUSED"].includes((error as NodeJS.ErrnoException).code ?? "");
 }
 
+export function relayAccessError(error: unknown, platform: NodeJS.Platform = process.platform): never {
+  if (platform === "win32" && ["EPERM", "EACCES"].includes((error as NodeJS.ErrnoException).code ?? "")) {
+    throw new Error("Cannot access the Agent Pair relay pipe. A relay started inside a restricted sandbox may be inaccessible to other clients. Close any affected team, then start `node dist/cli.js dashboard --no-open` in a normal terminal in this workspace and open fresh client sessions using the same installation and data directory.", { cause: error });
+  }
+  throw error;
+}
+
 export async function relayCall(entry: string, request: Request, signal?: AbortSignal): Promise<unknown> {
   const directory = dataDirectory();
   const secret = await brokerSecret(directory);
-  const path = endpoint(directory);
+  const channel = transport(directory);
   try {
-    return await call(path, secret, request, signal);
+    return await call(channel, secret, request, signal);
   } catch (error) {
-    if (!unavailable(error)) throw error;
+    if (!unavailable(error)) relayAccessError(error);
   }
   signal?.throwIfAborted();
   const worker = spawn(process.execPath, [entry, "broker"], {
@@ -174,9 +174,9 @@ export async function relayCall(entry: string, request: Request, signal?: AbortS
     await sleep(100, undefined, { signal });
     if (launchError) throw launchError;
     try {
-      return await call(path, secret, request, signal);
+      return await call(channel, secret, request, signal);
     } catch (error) {
-      if (!unavailable(error)) throw error;
+      if (!unavailable(error)) relayAccessError(error);
     }
   }
   throw new Error("Could not start the local Agent Pair relay. Run agent-pair doctor to check this environment.");
